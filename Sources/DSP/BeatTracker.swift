@@ -12,6 +12,8 @@ struct BeatResult {
     var envelopeRate: Double
     /// Насколько уверенно найден темп (0…1).
     var confidence: Double
+    /// Период доли в кадрах огибающей — нужен, чтобы перестроить сетку в другой октаве.
+    var periodFrames: Double = 0
 
     static let empty = BeatResult(
         bpm: 0, beats: [], downbeatOffset: 0, beatsPerBar: 4,
@@ -140,31 +142,141 @@ enum BeatTracker {
         return (60.0 * rate / refinedLag, refinedLag, confidence)
     }
 
+    // MARK: - Локальный темп
+
+    /// Период доли для каждого кадра огибающей.
+    ///
+    /// Считаем автокорреляцию в скользящем окне и ищем пик рядом с глобальной оценкой:
+    /// уходить далеко нельзя, иначе на слабом куске окно поймает половинный или двойной
+    /// период и сетка порвётся. Результат сглаживается — темп меняется плавно.
+    static func localPeriods(
+        envelope: [Float], rate: Double, globalPeriod: Double, tolerance: Double = 0.10
+    ) -> [Double] {
+        let count = envelope.count
+        guard count > 8, globalPeriod > 1 else {
+            return [Double](repeating: globalPeriod, count: max(0, count))
+        }
+
+        let windowFrames = max(Int(globalPeriod * 8), Int(4 * rate))
+        let step = max(1, Int(rate / 2))
+        let minLag = max(2, Int(globalPeriod * (1 - tolerance)))
+        let maxLag = min(count - 1, Int(globalPeriod * (1 + tolerance)) + 1)
+        guard maxLag > minLag else { return [Double](repeating: globalPeriod, count: count) }
+
+        var anchors: [(frame: Int, period: Double)] = []
+        var start = 0
+        while start < count {
+            let end = min(count, start + windowFrames)
+            guard end - start > maxLag * 2 else { break }
+
+            var bestScore = -Float.greatestFiniteMagnitude
+            var bestLag = Int(globalPeriod)
+            var scores = [Float](repeating: 0, count: maxLag + 1)
+            for lag in minLag...maxLag {
+                var sum: Float = 0
+                for i in (start + lag)..<end { sum += envelope[i] * envelope[i - lag] }
+                sum /= Float(end - start - lag)
+                scores[lag] = sum
+                if sum > bestScore {
+                    bestScore = sum
+                    bestLag = lag
+                }
+            }
+
+            // Уточнение пика параболой — иначе период квантуется шагом в один кадр,
+            // а это уже проценты темпа.
+            var refined = Double(bestLag)
+            if bestLag > minLag, bestLag < maxLag {
+                let y0 = Double(scores[bestLag - 1])
+                let y1 = Double(scores[bestLag])
+                let y2 = Double(scores[bestLag + 1])
+                let denominator = y0 - 2 * y1 + y2
+                if abs(denominator) > 1e-9 {
+                    let delta = 0.5 * (y0 - y2) / denominator
+                    if abs(delta) < 1 { refined += delta }
+                }
+            }
+            anchors.append((frame: (start + end) / 2, period: refined))
+            start += step
+        }
+
+        guard anchors.count > 1 else { return [Double](repeating: globalPeriod, count: count) }
+        smoothAnchors(&anchors)
+        // Локальная оценка шумит: на тихом такте окно легко ошибается на пару процентов.
+        // Тянем её к глобальной, чтобы отслеживать настоящий дрейф, а не дрожание метода.
+        for i in 0..<anchors.count {
+            anchors[i].period = globalPeriod + (anchors[i].period - globalPeriod) * 0.5
+        }
+
+        // Линейная интерполяция между опорными точками.
+        var periods = [Double](repeating: globalPeriod, count: count)
+        var index = 0
+        for frame in 0..<count {
+            while index + 1 < anchors.count && anchors[index + 1].frame < frame { index += 1 }
+            if frame <= anchors[0].frame {
+                periods[frame] = anchors[0].period
+            } else if frame >= anchors[anchors.count - 1].frame {
+                periods[frame] = anchors[anchors.count - 1].period
+            } else {
+                let left = anchors[index]
+                let right = anchors[index + 1]
+                let span = Double(right.frame - left.frame)
+                let position = span > 0 ? Double(frame - left.frame) / span : 0
+                periods[frame] = left.period + (right.period - left.period) * position
+            }
+        }
+        return periods
+    }
+
+    /// Скользящая медиана по пяти опорным точкам — снимает выбросы на тихих кусках,
+    /// где окно автокорреляции цепляется не за тот пик.
+    private static func smoothAnchors(_ anchors: inout [(frame: Int, period: Double)]) {
+        guard anchors.count > 2 else { return }
+        let source = anchors
+        for i in 0..<anchors.count {
+            let lower = max(0, i - 2)
+            let upper = min(source.count - 1, i + 2)
+            var window = (lower...upper).map { source[$0].period }
+            window.sort()
+            anchors[i].period = window[window.count / 2]
+        }
+    }
+
     // MARK: - Сетка долей (динамическое программирование)
 
     static func trackBeats(envelope: [Float], rate: Double, periodFrames: Double, tightness: Float = 100) -> [Double] {
-        guard periodFrames > 1, envelope.count > Int(periodFrames * 2) else { return [] }
-        let period = periodFrames
-        let searchStart = Int(-2 * period)
-        let searchEnd = Int(-period / 2)
+        trackBeats(envelope: envelope, rate: rate,
+                   periods: [Double](repeating: periodFrames, count: envelope.count),
+                   tightness: tightness)
+    }
+
+    /// Тот же DP, но период задаётся для каждого кадра отдельно.
+    ///
+    /// Живое исполнение не держит один темп: он плывёт на несколько процентов, и сетка,
+    /// построенная от единственного BPM, к середине записи уезжает от музыки. Здесь
+    /// ожидаемый интервал берётся локальный, поэтому доли следуют за исполнением.
+    static func trackBeats(envelope: [Float], rate: Double, periods: [Double], tightness: Float = 100) -> [Double] {
+        guard let maxPeriod = periods.max(), maxPeriod > 1,
+              envelope.count > Int(maxPeriod * 2), periods.count == envelope.count else { return [] }
+        let searchStart = Int(-2 * maxPeriod)
+        let searchEnd = Int(-(periods.min() ?? maxPeriod) / 2)
         guard searchStart <= searchEnd else { return [] }
 
         var cumulative = [Float](repeating: 0, count: envelope.count)
         var backlink = [Int](repeating: -1, count: envelope.count)
 
-        // Предрасчёт штрафа за отклонение интервала от периода.
-        var transitionCost = [Float](repeating: 0, count: searchEnd - searchStart + 1)
-        for (i, offset) in (searchStart...searchEnd).enumerated() {
-            transitionCost[i] = -tightness * Float(pow(log(Double(-offset) / period), 2))
-        }
-
         for t in 0..<envelope.count {
             var bestScore = -Float.greatestFiniteMagnitude
             var bestIndex = -1
-            for (i, offset) in (searchStart...searchEnd).enumerated() {
+            let period = periods[t]
+            for offset in searchStart...searchEnd {
                 let previous = t + offset
                 guard previous >= 0 else { continue }
-                let score = cumulative[previous] + transitionCost[i]
+                // Штраф за отклонение фактического интервала от ожидаемого здесь и сейчас.
+                let ratio = Double(-offset) / period
+                guard ratio > 0.4, ratio < 2.5 else { continue }
+                let penalty = -tightness * Float(pow(log(ratio), 2))
+                let score = cumulative[previous] + penalty
                 if score > bestScore {
                     bestScore = score
                     bestIndex = previous
@@ -180,7 +292,7 @@ enum BeatTracker {
         }
 
         // Старт обратного прохода — лучший максимум в хвосте длиной в один период.
-        let tailStart = max(0, envelope.count - Int(period))
+        let tailStart = max(0, envelope.count - Int(maxPeriod))
         var last = tailStart
         for t in tailStart..<envelope.count where cumulative[t] > cumulative[last] { last = t }
 
@@ -192,6 +304,28 @@ enum BeatTracker {
         }
         frames.reverse()
         return frames.map { Double($0) / rate }
+    }
+
+    /// Сетка долей для заданного периода — чтобы проверить гипотезу «темп вдвое быстрее».
+    ///
+    /// Автокорреляция одинаково хорошо объясняет и период, и его кратные: если бочка бьёт
+    /// через долю, половинный темп выглядит для неё не хуже настоящего. Разрешить этот
+    /// спор по одной огибающей нельзя — решает уже гармония, см. SongAnalyzer.
+    static func beats(envelope: [Float], rate: Double, periodFrames: Double) -> [Double] {
+        guard periodFrames > 1 else { return [] }
+        let periods = localPeriods(envelope: envelope, rate: rate, globalPeriod: periodFrames)
+        return trackBeats(envelope: envelope, rate: rate, periods: periods)
+    }
+
+    /// Средний интервал между долями — итоговый BPM считаем по факту, а не по оценке.
+    static func bpm(from beats: [Double], fallback: Double) -> Double {
+        guard beats.count > 3 else { return fallback }
+        var intervals = zip(beats.dropFirst(), beats).map { $0 - $1 }.sorted()
+        let median = intervals[intervals.count / 2]
+        intervals = intervals.filter { abs($0 - median) < median * 0.25 }
+        guard !intervals.isEmpty else { return fallback }
+        let mean = intervals.reduce(0, +) / Double(intervals.count)
+        return mean > 0 ? 60.0 / mean : fallback
     }
 
     // MARK: - Сильная доля
@@ -236,7 +370,8 @@ enum BeatTracker {
         let tempo = estimateTempo(envelope: envelope, rate: rate)
         guard tempo.bpm > 0 else { return .empty }
 
-        let beats = trackBeats(envelope: envelope, rate: rate, periodFrames: tempo.periodFrames)
+        let periods = localPeriods(envelope: envelope, rate: rate, globalPeriod: tempo.periodFrames)
+        let beats = trackBeats(envelope: envelope, rate: rate, periods: periods)
         let beatsPerBar = 4
         let downbeat = estimateDownbeat(
             beats: beats, envelope: envelope, rate: rate,
@@ -262,7 +397,8 @@ enum BeatTracker {
             beatsPerBar: beatsPerBar,
             onsetEnvelope: envelope,
             envelopeRate: rate,
-            confidence: tempo.confidence
+            confidence: tempo.confidence,
+            periodFrames: tempo.periodFrames
         )
     }
 }

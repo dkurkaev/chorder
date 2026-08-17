@@ -68,7 +68,10 @@ enum ChordRecognizer {
     }
 
     /// Косинусная близость кадра ко всем 72 шаблонам.
-    static func scores(for frame: [Float], key: KeyContext? = nil) -> [Float] {
+    static func scores(
+        for frame: [Float], key: KeyContext? = nil,
+        vocabulary: Set<Int>? = nil, vocabularyBoost: Float = 1.08, outsidePenalty: Float = 0.9
+    ) -> [Float] {
         var normalized = frame
         normalizeL2(&normalized)
 
@@ -78,6 +81,7 @@ enum ChordRecognizer {
             for k in 0..<12 { dot += normalized[k] * template.vector[k] }
             var score = max(0, dot) * template.prior
             if let key, key.contains(template.label) { score *= key.boost }
+            if let vocabulary { score *= vocabulary.contains(i) ? vocabularyBoost : outsidePenalty }
             out[i] = score
         }
         return out
@@ -109,6 +113,19 @@ enum ChordRecognizer {
         var silenceRatio: Float = 0.08
         /// Тональность фрагмента, если известна — диатоника получает фору.
         var key: KeyContext?
+        /// Аккорды, которые песня реально играет там, где её слышно чисто.
+        /// Остальные получают штраф: чаще всего это испорченная мелодией версия того же
+        /// аккорда, а не настоящая смена гармонии.
+        var vocabulary: Set<Int>?
+        var vocabularyBoost: Float = 1.08
+        var outsidePenalty: Float = 0.9
+        /// Какие смены аккордов песня действительно делает — снято с чистых мест.
+        /// Ключ — индекс шаблона, значение — доли переходов из него (сумма 1).
+        var transitions: [Int: [Int: Float]]?
+        /// На сколько дешевеет самый обычный для этого аккорда переход.
+        var transitionRelief: Float = 0.8
+        /// Во сколько раз дороже переход, которого песня в чистых местах не делала.
+        var unknownTransitionFactor: Float = 1.5
 
         static let `default` = Options()
 
@@ -136,9 +153,12 @@ enum ChordRecognizer {
         guard beats.count >= 2, !frames.isEmpty else { return [] }
 
         // Границы «долевых» окон: от начала записи до конца, с долями внутри.
+        // Огрызок короче половины доли отдельным окном не делаем: в него попадает
+        // атака или тишина, аккорд там случайный, а стоит он в выводе первым.
+        let beatLength = beats.count > 1 ? beats[1] - beats[0] : 0.5
         var boundaries = beats
-        if let first = boundaries.first, first > 0.05 { boundaries.insert(0, at: 0) }
-        if let last = boundaries.last, last < duration - 0.05 { boundaries.append(duration) }
+        if let first = boundaries.first, first > beatLength / 2 { boundaries.insert(0, at: 0) }
+        if let last = boundaries.last, duration - last > beatLength / 2 { boundaries.append(duration) }
 
         var beatFrames: [ChromaFrame] = []
         beatFrames.reserveCapacity(boundaries.count - 1)
@@ -214,7 +234,9 @@ enum ChordRecognizer {
         var emissions: [[Float]] = []
         emissions.reserveCapacity(frames.count)
         for frame in frames {
-            var s = scores(for: frame.values, key: options.key)
+            var s = scores(for: frame.values, key: options.key,
+                           vocabulary: options.vocabulary, vocabularyBoost: options.vocabularyBoost,
+                           outsidePenalty: options.outsidePenalty)
             s.append(options.noChordScore)
             if frame.energy < silenceThreshold {
                 for i in 0..<noneState { s[i] = 0 }
@@ -224,32 +246,70 @@ enum ChordRecognizer {
             emissions.append(s)
         }
 
-        // Прямой проход. Переход «в любое другое состояние» стоит одинаково,
-        // поэтому достаточно знать лучшее предыдущее состояние — O(T·S).
         var cost = emissions[0]
         var backpointers = [[Int32]](repeating: [Int32](repeating: 0, count: stateCount), count: frames.count)
 
-        for t in 1..<frames.count {
-            var bestPrev: Float = -.greatestFiniteMagnitude
-            var bestPrevIndex = 0
-            for s in 0..<stateCount where cost[s] > bestPrev {
-                bestPrev = cost[s]
-                bestPrevIndex = s
-            }
-
-            var next = [Float](repeating: 0, count: stateCount)
-            for s in 0..<stateCount {
-                let stay = cost[s]
-                let switchTo = bestPrev - options.changePenalty
-                if stay >= switchTo {
-                    next[s] = stay + emissions[t][s]
-                    backpointers[t][s] = Int32(s)
-                } else {
-                    next[s] = switchTo + emissions[t][s]
-                    backpointers[t][s] = Int32(bestPrevIndex)
+        if let transitions = options.transitions, !transitions.isEmpty {
+            // Стоимость смены зависит от того, делает ли песня такой переход. Если в чистых
+            // местах за A#m всегда шёл D#m, то и под голосом уход в D#m должен стоить дешевле,
+            // чем в случайный соседний аккорд. Это уже полный перебор предыдущих состояний.
+            var penalty = [[Float]](
+                repeating: [Float](repeating: options.changePenalty, count: stateCount), count: stateCount
+            )
+            for (from, targets) in transitions {
+                guard from < stateCount else { continue }
+                // Из этого аккорда мы знаем, куда песня ходит. Значит всё остальное —
+                // подозрительно: сначала дорожает всё, потом дешевеют знакомые пути.
+                for to in 0..<stateCount where to != from {
+                    penalty[from][to] = options.changePenalty * options.unknownTransitionFactor
+                }
+                for (to, share) in targets where to < stateCount {
+                    penalty[from][to] = options.changePenalty * (1 - options.transitionRelief * share)
                 }
             }
-            cost = next
+
+            for t in 1..<frames.count {
+                var next = [Float](repeating: 0, count: stateCount)
+                for s in 0..<stateCount {
+                    var best = cost[s]           // остаться — переход самому себе бесплатен
+                    var bestIndex = s
+                    for previous in 0..<stateCount where previous != s {
+                        let score = cost[previous] - penalty[previous][s]
+                        if score > best {
+                            best = score
+                            bestIndex = previous
+                        }
+                    }
+                    next[s] = best + emissions[t][s]
+                    backpointers[t][s] = Int32(bestIndex)
+                }
+                cost = next
+            }
+        } else {
+            // Быстрый путь: переход «в любое другое состояние» стоит одинаково,
+            // поэтому достаточно знать лучшее предыдущее состояние — O(T·S).
+            for t in 1..<frames.count {
+                var bestPrev: Float = -.greatestFiniteMagnitude
+                var bestPrevIndex = 0
+                for s in 0..<stateCount where cost[s] > bestPrev {
+                    bestPrev = cost[s]
+                    bestPrevIndex = s
+                }
+
+                var next = [Float](repeating: 0, count: stateCount)
+                for s in 0..<stateCount {
+                    let stay = cost[s]
+                    let switchTo = bestPrev - options.changePenalty
+                    if stay >= switchTo {
+                        next[s] = stay + emissions[t][s]
+                        backpointers[t][s] = Int32(s)
+                    } else {
+                        next[s] = switchTo + emissions[t][s]
+                        backpointers[t][s] = Int32(bestPrevIndex)
+                    }
+                }
+                cost = next
+            }
         }
 
         // Обратный проход
@@ -288,7 +348,10 @@ enum ChordRecognizer {
                 let state = path[index]
                 let score = state == noneState
                     ? Double(options.noChordScore)
-                    : Double(scores(for: frames[j].values, key: options.key)[state])
+                    : Double(scores(for: frames[j].values, key: options.key,
+                                        vocabulary: options.vocabulary,
+                                        vocabularyBoost: options.vocabularyBoost,
+                                        outsidePenalty: options.outsidePenalty)[state])
                 confidenceSum += score
                 j += 1
             }

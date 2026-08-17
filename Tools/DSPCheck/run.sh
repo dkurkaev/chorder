@@ -14,6 +14,7 @@ swiftc -O \
   Sources/DSP/ChordRecognizer.swift \
   Sources/DSP/BeatTracker.swift \
   Sources/DSP/KeyEstimator.swift \
+  Sources/Analysis/PhraseModel.swift \
   Sources/Analysis/SongAnalyzer.swift \
   Sources/Analysis/DemoSignal.swift \
   Tools/DSPCheck/main.swift \

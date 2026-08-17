@@ -4,11 +4,24 @@ import Foundation
 /// Чистый Foundation, без UI — можно гонять на любых сэмплах.
 enum SongAnalyzer {
 
+    /// Штраф аккорду, которого нет в словаре чистых мест. Подбор — через Tools/DSPCheck.
+    static var outsidePenalty: Float = 0.9
+    /// На сколько дешевеет переход, который песня действительно делает.
+    static var transitionRelief: Float = 0.4
+    /// Во сколько раз дороже переход, которого песня не делала. Единица — не штрафовать:
+    /// на проверке штраф чаще выдавливал верный аккорд в редкую соседнюю окраску,
+    /// чем исправлял ошибку.
+    static var unknownTransitionFactor: Float = 1.0
+
     static func analyze(
         samples: [Float],
         sampleRate: Double,
         chordOptions: ChordRecognizer.Options? = nil,
-        separation: SourceSeparator.Mode? = .full
+        separation: SourceSeparator.Mode? = .full,
+        useReferences: Bool = true,
+        useTransitions: Bool = true,
+        usePhrase: Bool = true,
+        diagnostics: ((String) -> Void)? = nil
     ) -> AnalysisResult {
         let duration = Double(samples.count) / sampleRate
         guard duration > 0.5 else { return .empty }
@@ -16,9 +29,10 @@ enum SongAnalyzer {
         // Аккорды считаем по аккомпанементу: солирующая мелодия даёт ноты вне аккорда,
         // из-за которых распознаватель теряет аккорд или дёргается на соседний.
         // Ритм — по исходной записи: удары нужны целиком, их разделение только ослабляет.
-        let harmony = separation.map {
-            SourceSeparator.separate(samples: samples, sampleRate: sampleRate, mode: $0).accompaniment
-        } ?? samples
+        let separated = separation.map {
+            SourceSeparator.separate(samples: samples, sampleRate: sampleRate, mode: $0)
+        }
+        let harmony = separated?.accompaniment ?? samples
 
         let chroma = ChromaExtractor.chromagram(samples: harmony, sampleRate: sampleRate)
         let beat = BeatTracker.analyze(samples: samples, sampleRate: sampleRate)
@@ -32,59 +46,399 @@ enum SongAnalyzer {
             frameOptions.key = context
         }
 
-        // Разбор по долям устойчивее: хрома усредняется внутри доли, границы аккордов
-        // попадают на сетку ритма. Без надёжного ритма падаем обратно на покадровый разбор.
-        let chords: [ChordSegment]
-        if beat.beats.count >= 4 {
-            chords = ChordRecognizer.beatSynchronousSegments(
-                frames: chroma, beats: beat.beats, duration: duration, options: beatOptions
+        // Без надёжного ритма разбираем покадрово — сетки долей просто нет.
+        guard beat.beats.count >= 4 else {
+            let chords = ChordRecognizer.segments(from: chroma, duration: duration, options: frameOptions)
+            return AnalysisResult(
+                duration: duration, bpm: (beat.bpm * 10).rounded() / 10,
+                beatsPerBar: beat.beatsPerBar, beats: beat.beats, downbeatOffset: 0,
+                key: key?.name, chords: chords, bars: [], tempoConfidence: beat.confidence
             )
-        } else {
-            chords = ChordRecognizer.segments(from: chroma, duration: duration, options: frameOptions)
         }
 
-        // Сетку тактов кладём на гармонию: сначала аккорд каждой доли, затем начало
-        // осмысленной части и фаза, при которой границы тактов совпадают со сменой аккорда.
-        let beatLabels = beatChords(beats: beat.beats, chords: chords, duration: duration)
-        let firstBeat = firstMeaningfulBeat(
-            beats: beat.beats,
-            beatChords: beatLabels,
-            beatsPerBar: beat.beatsPerBar,
-            envelope: beat.onsetEnvelope,
-            rate: beat.envelopeRate
-        )
-        let downbeatOffset = estimateBarStart(
-            beats: beat.beats,
-            beatChords: beatLabels,
-            from: firstBeat,
-            beatsPerBar: beat.beatsPerBar,
-            envelope: beat.onsetEnvelope,
-            rate: beat.envelopeRate
+        // Октава темпа: автокорреляция одинаково хорошо объясняет период и его кратные,
+        // поэтому спор решает гармония. Строим сетку для каждой гипотезы и берём ту,
+        // при которой такты действительно ложатся на смену аккордов.
+        var grid = bestGrid(
+            beat: beat, chroma: chroma, duration: duration, options: beatOptions
         )
 
-        let bars = buildBars(
-            beats: beat.beats,
-            beatsPerBar: beat.beatsPerBar,
-            startBeat: downbeatOffset,
-            beatChords: beatLabels,
-            duration: duration
-        )
+        // Второй проход по образцам из чистых мест. Там, где поёт голос, хрома засорена
+        // нотами мелодии и аккорд «уплывает» на соседний. Но тот же аккорд почти наверняка
+        // звучал где-то без голоса — оттуда и берём образец, с которым сверяемся.
+        if useReferences, let melody = separated?.melody, !melody.isEmpty {
+            let share = melodyShare(
+                beats: grid.beats, melody: melody, accompaniment: harmony, sampleRate: sampleRate
+            )
+            let model = cleanModel(grid: grid, melodyShare: share)
+            let names = model.vocabulary.map { ChordRecognizer.templates[$0].label.name }.sorted()
+            diagnostics?("Словарь чистых мест: \(names.count) — \(names.joined(separator: ", "))")
+            for (from, targets) in model.transitions.sorted(by: { $0.key < $1.key }) {
+                let list = targets.sorted { $0.value > $1.value }
+                    .map { "\(ChordRecognizer.templates[$0.key].label.name) \(Int($0.value * 100))%" }
+                diagnostics?("  переходы из \(ChordRecognizer.templates[from].label.name): "
+                             + list.joined(separator: ", "))
+            }
+
+            if !model.vocabulary.isEmpty {
+                var refined = beatOptions
+                refined.vocabulary = model.vocabulary
+                refined.outsidePenalty = outsidePenalty
+                refined.transitions = useTransitions ? model.transitions : nil
+                refined.transitionRelief = transitionRelief
+                refined.unknownTransitionFactor = unknownTransitionFactor
+                let candidate = makeGrid(
+                    beats: grid.beats, beat: beat, chroma: chroma,
+                    duration: duration, options: refined
+                )
+                diagnostics?(String(format: "Оценка сетки: без словаря %.3f, со словарём %.3f",
+                                    grid.score, candidate.score))
+                if candidate.score >= grid.score { grid = candidate }
+            }
+        }
+
+        // Фраза: песня крутит одну последовательность, и там, где её слышно плохо,
+        // разумнее достроить по ней, чем верить испорченной хроме.
+        if usePhrase, let melody = separated?.melody, !melody.isEmpty {
+            let share = melodyShare(
+                beats: grid.beats, melody: melody, accompaniment: harmony, sampleRate: sampleRate
+            )
+            if let tightened = applyPhrase(
+                to: grid, beat: beat, duration: duration,
+                melodyShare: share, diagnostics: diagnostics
+            ) {
+                grid = tightened
+            }
+        }
 
         // Лента и строка прогрессии должны показывать то же, что и такты: сетка уже
         // отбросила мусорное начало и убрала выбросы, и расходиться с ней нельзя.
-        let finalChords = bars.isEmpty ? chords : segments(from: bars, source: chords)
+        let finalChords = grid.bars.isEmpty ? grid.chords : segments(from: grid.bars, source: grid.chords)
 
         return AnalysisResult(
             duration: duration,
-            bpm: (beat.bpm * 10).rounded() / 10,
+            bpm: (BeatTracker.bpm(from: grid.beats, fallback: beat.bpm) * 10).rounded() / 10,
             beatsPerBar: beat.beatsPerBar,
-            beats: beat.beats,
-            downbeatOffset: downbeatOffset,
+            beats: grid.beats,
+            downbeatOffset: grid.startBeat,
             key: key?.name,
             chords: finalChords,
-            bars: bars,
+            bars: grid.bars,
             tempoConfidence: beat.confidence
         )
+    }
+
+    // MARK: - Словарь аккордов из чистых мест
+
+    /// Какие аккорды песня играет там, где солиста не слышно.
+    ///
+    /// Голос портит хрому: поверх A#m звучит нота, и распознаватель уходит на A#m7 или Fm.
+    /// Но тот же аккорд почти наверняка звучал и без голоса — там он определяется уверенно.
+    /// Собрав такие места, получаем набор аккордов песни; дальше похожие места читаются
+    /// как «свой, просто испорченный», а не как новая гармония.
+    struct CleanModel {
+        var vocabulary: Set<Int> = []
+        /// Из какого аккорда в какой песня переходит и как часто (доли, сумма по строке 1).
+        var transitions: [Int: [Int: Float]] = [:]
+    }
+
+    /// Насколько громко солист поёт на каждой доле — относительно аккомпанемента.
+    static func melodyShare(
+        beats: [Double], melody: [Float], accompaniment: [Float], sampleRate: Double
+    ) -> [Double] {
+        guard !beats.isEmpty, !melody.isEmpty else { return [] }
+        var result: [Double] = []
+        result.reserveCapacity(beats.count)
+        for (index, start) in beats.enumerated() {
+            let end = index + 1 < beats.count
+                ? beats[index + 1]
+                : start + (beats.count > 1 ? beats[1] - beats[0] : 0.5)
+            let from = max(0, Int(start * sampleRate))
+            let to = min(melody.count, Int(end * sampleRate))
+            guard to > from else { result.append(1); continue }
+            var melodyEnergy = 0.0
+            var backgroundEnergy = 0.0
+            for i in from..<to {
+                melodyEnergy += Double(melody[i] * melody[i])
+                if i < accompaniment.count {
+                    backgroundEnergy += Double(accompaniment[i] * accompaniment[i])
+                }
+            }
+            result.append(melodyEnergy / max(1e-12, melodyEnergy + backgroundEnergy))
+        }
+        return result
+    }
+
+    static func cleanModel(
+        grid: Grid, melodyShare: [Double]
+    ) -> CleanModel {
+        guard !grid.beats.isEmpty, !melodyShare.isEmpty else { return CleanModel() }
+
+        // Чистота считается по сегменту аккорда, а не по отдельной доле: доли, где голос
+        // молчит, разбросаны поодиночке, и переходов из них не собрать.
+        let labelToIndex = Dictionary(
+            uniqueKeysWithValues: ChordRecognizer.templates.enumerated().map { ($1.label, $0) }
+        )
+
+        struct CleanSegment {
+            var template: Int
+            var share: Double
+            var duration: Double
+        }
+
+        var segments: [CleanSegment] = []
+        for segment in grid.chords where !segment.label.isNone {
+            guard let template = labelToIndex[segment.label] else { continue }
+            var sum = 0.0
+            var count = 0
+            for (index, beat) in grid.beats.enumerated()
+            where index < melodyShare.count && beat >= segment.start && beat < segment.end {
+                sum += melodyShare[index]
+                count += 1
+            }
+            guard count > 0 else { continue }
+            segments.append(CleanSegment(
+                template: template, share: sum / Double(count), duration: segment.duration
+            ))
+        }
+        guard !segments.isEmpty else { return CleanModel() }
+
+        let threshold = segments.map { $0.share }.sorted()[segments.count / 2]
+
+        // Вес аккорда — его время, взвешенное по чистоте звучания. Учитываем всю запись,
+        // а не только тихую половину: аккорд, который почти всегда идёт под солистом,
+        // иначе выпадет из словаря, и потом его нечем будет отличить от постороннего.
+        var weight: [Int: Double] = [:]
+        for segment in segments {
+            weight[segment.template, default: 0] += segment.duration * (1 - segment.share)
+        }
+        guard !weight.isEmpty else { return CleanModel() }
+
+        // Берём аккорды, покрывающие основное чистое время: редкие гости почти всегда
+        // сами являются испорченной версией частого аккорда.
+        let ranked = weight.keys.sorted { weight[$0]! > weight[$1]! }
+        let total = weight.values.reduce(0, +)
+        var vocabulary: Set<Int> = []
+        var covered = 0.0
+        for index in ranked {
+            // Аккорд, на который приходятся считаные проценты чистого времени, — почти
+            // всегда испорченная версия соседа, а не отдельная гармония.
+            guard weight[index]! >= 0.08 * total else { break }
+            vocabulary.insert(index)
+            covered += weight[index]!
+            if covered >= 0.9 * total { break }
+        }
+
+        // Какие смены песня делает. Берём пары соседних сегментов, где обе стороны слышно
+        // чисто, — иначе в модель попадёт та самая ошибка, ради которой всё затевалось.
+        var counts: [Int: [Int: Double]] = [:]
+        for (previous, current) in zip(segments, segments.dropFirst()) {
+            guard previous.share <= threshold, current.share <= threshold,
+                  previous.template != current.template,
+                  vocabulary.contains(previous.template), vocabulary.contains(current.template)
+            else { continue }
+            counts[previous.template, default: [:]][current.template, default: 0] += 1
+        }
+
+        var transitions: [Int: [Int: Float]] = [:]
+        for (from, targets) in counts {
+            let sum = targets.values.reduce(0, +)
+            guard sum >= 2 else { continue }        // один случай — это не правило
+            transitions[from] = targets.mapValues { Float($0 / sum) }
+        }
+
+        return CleanModel(vocabulary: vocabulary, transitions: transitions)
+    }
+
+    // MARK: - Фраза
+
+    /// Достраивает такты по повторяющейся фразе записи.
+    ///
+    /// Меняем только доли, где запись сама себе противоречит: пусто или аккорд не из
+    /// словаря песни. Там, где хрома уверенно говорит своё, фразу не навязываем — иначе
+    /// потеряются настоящие отклонения от неё.
+    static func applyPhrase(
+        to grid: Grid, beat: BeatResult, duration: Double,
+        melodyShare: [Double], diagnostics: ((String) -> Void)?
+    ) -> Grid? {
+        guard !grid.bars.isEmpty, !melodyShare.isEmpty else { return nil }
+
+        let barChords = grid.bars.map { bar -> ChordLabel in
+            var counts: [ChordLabel: Int] = [:]
+            for chord in bar.beatChords { counts[chord, default: 0] += 1 }
+            return counts.max { $0.value < $1.value }?.key ?? .none
+        }
+
+        // Фразу ищем по тактам, где солиста почти не слышно: под голосом аккорды сами
+        // искажены, и фраза, снятая с них, закрепила бы ошибку вместо того чтобы её чинить.
+        var barShare: [Double] = []
+        for (index, bar) in grid.bars.enumerated() {
+            _ = index
+            var sum = 0.0
+            var count = 0
+            for (beatIndex, time) in grid.beats.enumerated()
+            where beatIndex < melodyShare.count && time >= bar.start && time < bar.end {
+                sum += melodyShare[beatIndex]
+                count += 1
+            }
+            barShare.append(count > 0 ? sum / Double(count) : 1)
+        }
+        let quietLimit = barShare.sorted()[barShare.count / 2]
+        let cleanBars = zip(barChords, barShare).filter { $0.1 <= quietLimit }.map { $0.0 }
+
+        guard var phrase = PhraseModel.find(barChords: cleanBars, beatsPerBar: beat.beatsPerBar)
+                ?? PhraseModel.find(barChords: barChords, beatsPerBar: beat.beatsPerBar) else {
+            return nil
+        }
+        // Читаем фразу с того аккорда, с которого её играет запись, а не с произвольного
+        // места кольца.
+        if let opening = barChords.first(where: { !$0.isNone }) {
+            phrase = PhraseModel.rotated(phrase, toStartWith: opening)
+        }
+        diagnostics?(String(
+            format: "Фраза: %@ (по %d долей, покрытие %.0f%%)",
+            phrase.chords.map { $0.name }.joined(separator: " – "),
+            phrase.beatsPerChord, phrase.support * 100
+        ))
+
+        let labels = beatChords(beats: grid.beats, chords: grid.chords, duration: duration)
+        let start = grid.startBeat
+        guard start < labels.count else { return nil }
+        let tail = Array(labels[start...])
+        guard let expected = PhraseModel.expectedChords(phrase: phrase, beatChords: tail) else {
+            diagnostics?("Фраза не согласуется с записью — оставляю как есть")
+            return nil
+        }
+
+        let vocabulary = Set(phrase.chords)
+        let noisyLimit = melodyShare.sorted()[melodyShare.count / 2]
+        var corrected = labels
+        var changes = 0
+        for (offset, expectedChord) in expected.enumerated() {
+            let index = start + offset
+            guard index < corrected.count, corrected[index] != expectedChord else { continue }
+            // Правим там, где хроме верить нельзя: доля пустая, аккорд вообще не из фразы,
+            // либо поверх играет голос. Где солиста нет, а хрома уверенно говорит своё,
+            // фразу не навязываем — иначе потеряются настоящие отклонения от неё.
+            // Под голосом верим фразе только там, где аккорд явно «залип»: тянется с
+            // предыдущей доли, хотя фраза давно ушла дальше. Просто громкий голос — ещё
+            // не повод переписывать уверенно распознанный аккорд.
+            let isNoisy = index < melodyShare.count && melodyShare[index] > noisyLimit
+            let isStuck = index > 0 && corrected[index] == corrected[index - 1]
+            guard corrected[index].isNone || !vocabulary.contains(corrected[index])
+                    || (isNoisy && isStuck) else {
+                continue
+            }
+            corrected[index] = expectedChord
+            changes += 1
+        }
+        diagnostics?("Фраза поправила долей: \(changes)")
+        guard changes > 0 else { return nil }
+
+        let bars = buildBars(
+            beats: grid.beats, beatsPerBar: beat.beatsPerBar,
+            startBeat: start, beatChords: corrected, duration: duration
+        )
+        let chords = segments(from: bars, source: grid.chords)
+        return Grid(
+            beats: grid.beats, chords: chords, bars: bars, startBeat: start,
+            score: gridScore(bars: bars, beats: grid.beats)
+        )
+    }
+
+    // MARK: - Выбор сетки
+
+    struct Grid {
+        var beats: [Double]
+        var chords: [ChordSegment]
+        var bars: [Bar]
+        var startBeat: Int
+        /// Насколько хорошо такты объясняют гармонию: доля тактов под одним аккордом.
+        var score: Double
+    }
+
+    /// Перебирает октавы темпа и возвращает сетку, лучше всего объясняющую гармонию.
+    static func bestGrid(
+        beat: BeatResult, chroma: [ChromaFrame], duration: Double, options: ChordRecognizer.Options
+    ) -> Grid {
+        var candidates: [[Double]] = [beat.beats]
+        // Половинный период = вдвое более быстрый темп. Проверяем и его, и обратную
+        // гипотезу, оставаясь в человеческом диапазоне.
+        let period = beat.periodFrames
+        if period > 2, !beat.onsetEnvelope.isEmpty {
+            let bpm = 60.0 * beat.envelopeRate / period
+            if bpm * 2 <= BeatTracker.maxBPM {
+                candidates.append(BeatTracker.beats(
+                    envelope: beat.onsetEnvelope, rate: beat.envelopeRate, periodFrames: period / 2
+                ))
+            }
+            if bpm / 2 >= BeatTracker.minBPM {
+                candidates.append(BeatTracker.beats(
+                    envelope: beat.onsetEnvelope, rate: beat.envelopeRate, periodFrames: period * 2
+                ))
+            }
+        }
+
+        var best: Grid?
+        for beats in candidates where beats.count >= 4 {
+            let grid = makeGrid(
+                beats: beats, beat: beat, chroma: chroma, duration: duration, options: options
+            )
+            if best == nil || grid.score > best!.score { best = grid }
+        }
+        return best ?? makeGrid(
+            beats: beat.beats, beat: beat, chroma: chroma, duration: duration, options: options
+        )
+    }
+
+    private static func makeGrid(
+        beats: [Double], beat: BeatResult, chroma: [ChromaFrame],
+        duration: Double, options: ChordRecognizer.Options
+    ) -> Grid {
+        let chords = ChordRecognizer.beatSynchronousSegments(
+            frames: chroma, beats: beats, duration: duration, options: options
+        )
+
+        // Сетку тактов кладём на гармонию: сначала аккорд каждой доли, затем начало
+        // осмысленной части и фаза, при которой границы тактов совпадают со сменой аккорда.
+        let labels = beatChords(beats: beats, chords: chords, duration: duration)
+        let firstBeat = firstMeaningfulBeat(
+            beats: beats, beatChords: labels, beatsPerBar: beat.beatsPerBar,
+            envelope: beat.onsetEnvelope, rate: beat.envelopeRate
+        )
+        let startBeat = estimateBarStart(
+            beats: beats, beatChords: labels, from: firstBeat, beatsPerBar: beat.beatsPerBar,
+            envelope: beat.onsetEnvelope, rate: beat.envelopeRate
+        )
+        let bars = buildBars(
+            beats: beats, beatsPerBar: beat.beatsPerBar,
+            startBeat: startBeat, beatChords: labels, duration: duration
+        )
+
+        return Grid(
+            beats: beats, chords: chords, bars: bars, startBeat: startBeat,
+            score: gridScore(bars: bars, beats: beats)
+        )
+    }
+
+    /// Оценка сетки: доля тактов, целиком лежащих под одним аккордом. Такт, в котором
+    /// аккорд меняется, — признак того, что мы делим музыку не там, где она делится.
+    /// Слишком дробная сетка отсекается приором на привычный темп.
+    private static func gridScore(bars: [Bar], beats: [Double]) -> Double {
+        guard !bars.isEmpty, beats.count > 1 else { return 0 }
+        let steady = bars.filter { bar in
+            !(bar.beatChords.first?.isNone ?? true) && bar.beatChords.allSatisfy { $0 == bar.beatChords[0] }
+        }.count
+        let named = bars.flatMap { $0.beatChords }.filter { !$0.isNone }.count
+        let total = max(1, bars.flatMap { $0.beatChords }.count)
+
+        let intervals = zip(beats.dropFirst(), beats).map { $0 - $1 }.sorted()
+        let bpm = 60.0 / max(1e-6, intervals[intervals.count / 2])
+        // Тот же лог-нормальный приор, что и при оценке темпа: без него побеждает
+        // самая дробная сетка — в коротком такте аккорд не успевает смениться.
+        let prior = exp(-0.5 * pow(log2(bpm / 120.0) / 1.1, 2))
+
+        return (Double(steady) / Double(bars.count) + 0.35 * Double(named) / Double(total)) * prior
     }
 
     /// Сворачивает доли тактов обратно в отрезки аккордов: подряд идущие одинаковые

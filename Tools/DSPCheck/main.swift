@@ -95,6 +95,9 @@ let env = ProcessInfo.processInfo.environment
 if let k = env["REPET_K"].flatMap(Int.init) { SourceSeparator.similarFrames = k }
 if let e = env["REPET_EXP"].flatMap(Float.init) { SourceSeparator.maskExponent = e }
 if let f = env["REPET_FLOOR"].flatMap(Float.init) { SourceSeparator.maskFloor = f }
+if let p = env["VOCAB_PEN"].flatMap(Float.init) { SongAnalyzer.outsidePenalty = p }
+if let r = env["TRANS_RELIEF"].flatMap(Float.init) { SongAnalyzer.transitionRelief = r }
+if let u = env["TRANS_UNKNOWN"].flatMap(Float.init) { SongAnalyzer.unknownTransitionFactor = u }
 
 if ProcessInfo.processInfo.environment["TRACKS"] == "1" {
     let started = Date()
@@ -128,7 +131,11 @@ if let penalty = ProcessInfo.processInfo.environment["PENALTY"].flatMap(Float.in
 }
 let analysisStarted = Date()
 let result = SongAnalyzer.analyze(samples: samples, sampleRate: sampleRate,
-                                  chordOptions: chordOptions, separation: separationMode)
+                                  chordOptions: chordOptions, separation: separationMode,
+                                  useReferences: env["ADAPT"] != "0",
+                                  useTransitions: env["TRANS"] != "0",
+                                  usePhrase: env["PHRASE"] != "0",
+                                  diagnostics: { print($0) })
 print(String(format: "Анализ занял %.2f с", -analysisStarted.timeIntervalSinceNow))
 
 print("")
@@ -142,6 +149,42 @@ for segment in result.chords {
                  segment.start, segment.end, segment.label.name as NSString, segment.confidence))
 }
 print("Прогрессия: \(result.progressionSummary)")
+
+// Как темп ведёт себя по ходу записи: если он плывёт, средний BPM врёт везде.
+if result.beats.count > 4 {
+    let intervals = zip(result.beats.dropFirst(), result.beats).map { $0 - $1 }
+    let sorted = intervals.sorted()
+    print(String(format: "Интервал долей: медиана %.3f с (%.1f BPM), мин %.3f, макс %.3f",
+                 sorted[sorted.count / 2], 60 / sorted[sorted.count / 2], sorted.first!, sorted.last!))
+    // Проверка октавы: если между нашими долями лежат такие же сильные онсеты,
+    // значит настоящий шаг вдвое короче, а мы считаем через одну.
+    let (envelope, rate) = BeatTracker.onsetEnvelope(samples: samples, sampleRate: sampleRate)
+    func strength(at times: [Double]) -> Double {
+        var sum = 0.0
+        var count = 0
+        for time in times {
+            let frame = Int((time * rate).rounded())
+            guard frame >= 1, frame < envelope.count - 1 else { continue }
+            sum += Double(max(envelope[frame - 1], max(envelope[frame], envelope[frame + 1])))
+            count += 1
+        }
+        return count > 0 ? sum / Double(count) : 0
+    }
+    let midpoints = zip(result.beats, result.beats.dropFirst()).map { ($0 + $1) / 2 }
+    print(String(format: "Сила онсетов: на долях %.3f, посередине между ними %.3f (отношение %.2f)",
+                 strength(at: result.beats), strength(at: midpoints),
+                 strength(at: midpoints) / max(1e-9, strength(at: result.beats))))
+
+    var line = "Локальный BPM по 8 долям: "
+    var index = 0
+    while index + 8 <= intervals.count {
+        let window = intervals[index..<(index + 8)]
+        let mean = window.reduce(0, +) / Double(window.count)
+        line += String(format: "%.0f ", 60 / mean)
+        index += 8
+    }
+    print(line)
+}
 
 print("")
 print("Такты:")
@@ -171,6 +214,17 @@ if let first = result.bars.first {
     let steady = result.bars.filter { bar in
         !(bar.beatChords.first?.isNone ?? true) && bar.beatChords.allSatisfy { $0 == bar.beatChords[0] }
     }.count
+    // Распределение аккордов по тактам: если песня крутит цикл из четырёх, а один из них
+    // почти исчез — значит его съел похожий сосед.
+    var perChord: [String: Int] = [:]
+    for bar in result.bars {
+        guard let first = bar.beatChords.first, !first.isNone,
+              bar.beatChords.allSatisfy({ $0 == first }) else { continue }
+        perChord[first.name, default: 0] += 1
+    }
+    print("Такты по аккордам: " + perChord.sorted { $0.value > $1.value }
+        .map { "\($0.key)×\($0.value)" }.joined(separator: "  "))
+
     print(String(format: "ПОКРЫТИЕ: %d/%d долей с аккордом (%.0f%%); РОВНЫХ ТАКТОВ: %d/%d (%.0f%%)",
                  named, allBeats.count, 100 * Double(named) / Double(max(1, allBeats.count)),
                  steady, result.bars.count, 100 * Double(steady) / Double(max(1, result.bars.count))))
