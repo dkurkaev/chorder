@@ -32,6 +32,18 @@ targets:
           - UIInterfaceOrientationPortrait
         UIUserInterfaceStyle: Dark
         ITSAppUsesNonExemptEncryption: false
+        # Чтобы Chorder был в «Поделиться» у Voice Memos и умел открывать аудио из Файлов.
+        LSSupportsOpeningDocumentsInPlace: true
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Аудиозапись
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
+            LSItemContentTypes:
+              - public.audio
+              - public.mpeg-4-audio
+              - com.apple.m4a-audio
+              - public.aiff-audio
+              - com.microsoft.waveform-audio
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.chorder.app

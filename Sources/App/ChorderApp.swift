@@ -27,10 +27,17 @@ final class AppRouter: ObservableObject {
 
     @Published var tab: Tab = .record
     @Published var recordToOpen: UUID?
+    /// Аудиофайл, переданный в приложение снаружи — из Voice Memos, Файлов или почты.
+    @Published var pendingImportURL: URL?
 
     func open(recordID: UUID) {
         recordToOpen = recordID
         tab = .library
+    }
+
+    func importAudio(from url: URL) {
+        pendingImportURL = url
+        tab = .record
     }
 }
 
@@ -40,6 +47,7 @@ struct RootView: View {
 
     var body: some View {
         content
+            .onOpenURL { url in router.importAudio(from: url) }
         #if DEBUG
             .task {
                 guard DemoLibrary.isRequested else { return }

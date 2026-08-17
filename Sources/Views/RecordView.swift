@@ -1,5 +1,6 @@
 import SwiftData
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct RecordView: View {
     @Environment(\.modelContext) private var modelContext
@@ -10,6 +11,8 @@ struct RecordView: View {
     @State private var banner: BannerMessage?
     @State private var isPressing = false
     @State private var dismissWorkItem: DispatchWorkItem?
+    @State private var isFilePickerPresented = false
+    @State private var isImporting = false
 
     var body: some View {
         NavigationStack {
@@ -20,8 +23,9 @@ struct RecordView: View {
                     header
                     Spacer(minLength: 0)
                     recorderDial
-                    Spacer(minLength: 0)
                     timer
+                    Spacer(minLength: 0)
+                    importButton
                     problem
                 }
                 .padding(.horizontal, 20)
@@ -52,8 +56,31 @@ struct RecordView: View {
             }
             .navigationBarHidden(true)
         }
+        .fileImporter(
+            isPresented: $isFilePickerPresented,
+            allowedContentTypes: [.audio],
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case .success(let urls):
+                guard let url = urls.first else { return }
+                startImport(from: url)
+            case .failure(let error):
+                showImportFailure(error)
+            }
+        }
+        // Файл, переданный из Voice Memos или другого приложения через «Поделиться».
+        .onChange(of: router.pendingImportURL) { _, url in
+            guard let url else { return }
+            router.pendingImportURL = nil
+            startImport(from: url)
+        }
         .onAppear {
             recorder.onMaxDurationReached = { stop() }
+            if let url = router.pendingImportURL {
+                router.pendingImportURL = nil
+                startImport(from: url)
+            }
             #if DEBUG
             if CommandLine.arguments.contains("-simulateSpectrum") {
                 recorder.startSimulation()
@@ -158,6 +185,33 @@ struct RecordView: View {
             .frame(height: 68)
     }
 
+    /// Разбор готового файла — быстрый способ прогнать алгоритм на одном и том же материале.
+    private var importButton: some View {
+        Button {
+            isFilePickerPresented = true
+        } label: {
+            HStack(spacing: 8) {
+                if isImporting {
+                    ProgressView().controlSize(.small).tint(Theme.textPrimary)
+                } else {
+                    Image(systemName: "square.and.arrow.down")
+                        .font(.system(size: 16, weight: .semibold))
+                }
+                Text(isImporting ? "Разбираю файл" : "Импортировать файл")
+                    .font(.subheadline.weight(.semibold))
+            }
+            .foregroundStyle(Theme.textPrimary)
+            .padding(.horizontal, 20)
+            .frame(height: 46)
+            .background(Theme.surfaceHigh, in: Capsule())
+            .overlay(Capsule().stroke(Color.white.opacity(0.08), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .disabled(isImporting || recorder.isRecording)
+        .opacity(recorder.isRecording ? 0 : 1)
+        .animation(.easeInOut(duration: 0.2), value: recorder.isRecording)
+    }
+
     /// Показывается только когда есть что сказать по делу.
     @ViewBuilder private var problem: some View {
         switch recorder.state {
@@ -205,15 +259,8 @@ struct RecordView: View {
                 return
             }
 
-            let record = SongRecord(title: defaultTitle, duration: duration, audioURL: url)
-            modelContext.insert(record)
-            try? modelContext.save()
-
-            analysisQueue.enqueue(
-                recordID: record.id,
-                samples: samples,
-                sampleRate: AudioRecorder.sampleRate,
-                container: modelContext.container
+            let record = createRecord(
+                title: defaultTitle, samples: samples, url: url, duration: duration
             )
 
             show(BannerMessage(
@@ -223,6 +270,63 @@ struct RecordView: View {
                 recordID: record.id
             ))
         }
+    }
+
+    // MARK: - Импорт
+
+    private func startImport(from url: URL) {
+        guard !isImporting else { return }
+        isImporting = true
+        AudioImporter.load(from: url) { result in
+            isImporting = false
+            switch result {
+            case .success(let imported):
+                let record = createRecord(
+                    title: imported.title,
+                    samples: imported.samples,
+                    url: imported.url,
+                    duration: imported.duration
+                )
+                show(BannerMessage(
+                    icon: "checkmark.circle.fill",
+                    title: "Файл импортирован",
+                    subtitle: imported.wasTrimmed
+                        ? "Взял первую минуту — разбираю аккорды и ритм"
+                        : "Разбираю аккорды и ритм — нажми, чтобы открыть",
+                    recordID: record.id
+                ))
+            case .failure(let error):
+                showImportFailure(error)
+            }
+        }
+    }
+
+    private func showImportFailure(_ error: Error) {
+        show(BannerMessage(
+            icon: "exclamationmark.triangle.fill",
+            title: "Импорт не удался",
+            subtitle: error.localizedDescription,
+            isWarning: true
+        ))
+    }
+
+    /// Общий путь для микрофона и импорта: запись появляется в библиотеке сразу,
+    /// разбор дописывается по готовности.
+    @discardableResult
+    private func createRecord(
+        title: String, samples: [Float], url: URL?, duration: Double
+    ) -> SongRecord {
+        let record = SongRecord(title: title, duration: duration, audioURL: url)
+        modelContext.insert(record)
+        try? modelContext.save()
+
+        analysisQueue.enqueue(
+            recordID: record.id,
+            samples: samples,
+            sampleRate: AudioRecorder.sampleRate,
+            container: modelContext.container
+        )
+        return record
     }
 
     private func show(_ message: BannerMessage) {
