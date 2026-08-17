@@ -86,12 +86,16 @@ enum AudioImporter {
 
             var error: NSError?
             let status = converter.convert(to: output, error: &error) { _, inputStatus in
-                guard let input = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: readSize) else {
+                // Читать строго до конца файла: за границей `read` бросает ошибку,
+                // а не возвращает пустой буфер.
+                let remaining = file.length - file.framePosition
+                guard remaining > 0,
+                      let input = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: readSize) else {
                     inputStatus.pointee = .endOfStream
                     return nil
                 }
                 do {
-                    try file.read(into: input, frameCount: readSize)
+                    try file.read(into: input, frameCount: AVAudioFrameCount(min(Int64(readSize), remaining)))
                 } catch {
                     readFailed = true
                     inputStatus.pointee = .endOfStream

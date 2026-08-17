@@ -42,7 +42,7 @@ func loadAudio(path: String) -> [Float]? {
 let arguments = CommandLine.arguments.dropFirst()
 let mode = arguments.first ?? "clean"
 let isSynthetic = mode == "clean" || mode == "noisy"
-let samples: [Float]
+var samples: [Float]
 
 switch mode {
 case "clean":
@@ -60,6 +60,15 @@ default:
     }
     samples = loaded
     print("=== Файл: \(mode) ===")
+}
+
+// LIMIT=60 — обрезать так же, как это делает приложение при импорте файла.
+if let limit = ProcessInfo.processInfo.environment["LIMIT"].flatMap(Double.init) {
+    let frames = Int(limit * sampleRate)
+    if samples.count > frames {
+        samples = Array(samples.prefix(frames))
+        print(String(format: "Обрезано до %.0f с", limit))
+    }
 }
 
 var peak: Float = 0
@@ -90,6 +99,28 @@ for segment in result.chords {
                  segment.start, segment.end, segment.label.name as NSString, segment.confidence))
 }
 print("Прогрессия: \(result.progressionSummary)")
+
+print("")
+print("Такты:")
+for bar in result.bars {
+    let chords = bar.beatChords.map { $0.isNone ? "·" : $0.name }.joined(separator: " ")
+    print(String(format: "  %2d  %5.2f – %5.2f  |%@|", bar.index + 1, bar.start, bar.end, chords as NSString))
+}
+if let first = result.bars.first {
+    let labels = SongAnalyzer.beatChords(beats: result.beats, chords: result.chords, duration: result.duration)
+    let meaningful = SongAnalyzer.firstMeaningfulBeat(
+        beats: result.beats, beatChords: labels, beatsPerBar: result.beatsPerBar,
+        envelope: [], rate: 0
+    )
+    print(String(format: "Первый такт: доля %d, t=%.2f с. Первая осмысленная доля по гармонии: %d (t=%.2f с)",
+                 result.downbeatOffset, first.start, meaningful,
+                 meaningful < result.beats.count ? result.beats[meaningful] : 0))
+    let changes = result.chords.dropFirst().map { $0.start }
+    let onGrid = changes.filter { change in
+        result.bars.contains { abs($0.start - change) < 0.12 }
+    }
+    print("Смен аккордов: \(changes.count), из них на границе такта: \(onGrid.count)")
+}
 
 // MARK: - Диагностика хромы
 
