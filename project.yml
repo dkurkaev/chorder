@@ -7,6 +7,12 @@ options:
   groupSortPosition: top
 
 settings:
+  configs:
+    # Отладочная сборка тоже с оптимизацией: разбор — это плотная арифметика по
+    # спектрограмме, и без -O он идёт десятки секунд вместо пары. Пошаговая отладка
+    # самого DSP от этого страдает, но ждать минуту на каждый прогон хуже.
+    Debug:
+      SWIFT_OPTIMIZATION_LEVEL: "-O"
   base:
     SWIFT_VERSION: "5.0"
     MARKETING_VERSION: "0.1"

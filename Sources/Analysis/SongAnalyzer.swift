@@ -7,12 +7,20 @@ enum SongAnalyzer {
     static func analyze(
         samples: [Float],
         sampleRate: Double,
-        chordOptions: ChordRecognizer.Options? = nil
+        chordOptions: ChordRecognizer.Options? = nil,
+        separation: SourceSeparator.Mode? = .full
     ) -> AnalysisResult {
         let duration = Double(samples.count) / sampleRate
         guard duration > 0.5 else { return .empty }
 
-        let chroma = ChromaExtractor.chromagram(samples: samples, sampleRate: sampleRate)
+        // Аккорды считаем по аккомпанементу: солирующая мелодия даёт ноты вне аккорда,
+        // из-за которых распознаватель теряет аккорд или дёргается на соседний.
+        // Ритм — по исходной записи: удары нужны целиком, их разделение только ослабляет.
+        let harmony = separation.map {
+            SourceSeparator.separate(samples: samples, sampleRate: sampleRate, mode: $0).accompaniment
+        } ?? samples
+
+        let chroma = ChromaExtractor.chromagram(samples: harmony, sampleRate: sampleRate)
         let beat = BeatTracker.analyze(samples: samples, sampleRate: sampleRate)
         let key = KeyEstimator.estimate(from: chroma)
 
@@ -62,6 +70,10 @@ enum SongAnalyzer {
             duration: duration
         )
 
+        // Лента и строка прогрессии должны показывать то же, что и такты: сетка уже
+        // отбросила мусорное начало и убрала выбросы, и расходиться с ней нельзя.
+        let finalChords = bars.isEmpty ? chords : segments(from: bars, source: chords)
+
         return AnalysisResult(
             duration: duration,
             bpm: (beat.bpm * 10).rounded() / 10,
@@ -69,10 +81,47 @@ enum SongAnalyzer {
             beats: beat.beats,
             downbeatOffset: downbeatOffset,
             key: key?.name,
-            chords: chords,
+            chords: finalChords,
             bars: bars,
             tempoConfidence: beat.confidence
         )
+    }
+
+    /// Сворачивает доли тактов обратно в отрезки аккордов: подряд идущие одинаковые
+    /// доли склеиваются. Уверенность берём у исходных отрезков, накрывающих этот кусок.
+    static func segments(from bars: [Bar], source: [ChordSegment]) -> [ChordSegment] {
+        var result: [ChordSegment] = []
+        for bar in bars {
+            let beatCount = bar.beatChords.count
+            guard beatCount > 0 else { continue }
+            let beatLength = (bar.end - bar.start) / Double(beatCount)
+            for (index, label) in bar.beatChords.enumerated() {
+                let start = bar.start + Double(index) * beatLength
+                let end = index == beatCount - 1 ? bar.end : start + beatLength
+                if var last = result.last, last.label == label, abs(last.end - start) < 1e-6 {
+                    last.end = end
+                    result[result.count - 1] = last
+                } else {
+                    result.append(ChordSegment(
+                        label: label, start: start, end: end,
+                        confidence: confidence(in: source, from: start, to: end)
+                    ))
+                }
+            }
+        }
+        return result
+    }
+
+    private static func confidence(in source: [ChordSegment], from start: Double, to end: Double) -> Double {
+        var weighted = 0.0
+        var total = 0.0
+        for segment in source {
+            let overlap = min(end, segment.end) - max(start, segment.start)
+            guard overlap > 0 else { continue }
+            weighted += segment.confidence * overlap
+            total += overlap
+        }
+        return total > 0 ? weighted / total : 0
     }
 
     // MARK: - Такты
@@ -215,13 +264,12 @@ enum SongAnalyzer {
             let middle = labels[(first + 1)...(last - 1)]
             // Соседей читаем из исходного массива: правки соседнего такта не должны
             // тянуть за собой цепочку.
-            if let core = middle.first, middle.allSatisfy({ $0 == core }) {
-                if labels[last] != core, last + 1 < labels.count, labels[last + 1] == labels[last] {
-                    result[last] = core
-                }
-                if labels[first] != core, first > 0, labels[first - 1] == labels[first] {
-                    result[first] = core
-                }
+            // Середина такта однородна — значит такт держится под одним аккордом, а крайние
+            // доли, выбивающиеся из него, это либо край смены, уехавший к соседу, либо
+            // выброс на стыке аккордов. И то и другое место в такте не заслужило.
+            if let core = middle.first, middle.allSatisfy({ $0 == core }), !core.isNone {
+                if labels[last] != core { result[last] = core }
+                if labels[first] != core { result[first] = core }
             }
             index += beatsPerBar
         }

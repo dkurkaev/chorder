@@ -8,6 +8,8 @@ swiftc -O \
   Sources/Models/ChordLabel.swift \
   Sources/Models/AnalysisResult.swift \
   Sources/DSP/FFTProcessor.swift \
+  Sources/DSP/STFT.swift \
+  Sources/DSP/SourceSeparator.swift \
   Sources/DSP/ChromaExtractor.swift \
   Sources/DSP/ChordRecognizer.swift \
   Sources/DSP/BeatTracker.swift \

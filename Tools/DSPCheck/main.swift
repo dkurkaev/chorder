@@ -81,12 +81,55 @@ let rms = sqrt(sumOfSquares / Float(max(1, samples.count)))
 print(String(format: "Сэмплов: %d (%.2f с), пик %.3f, RMS %.4f (%.1f дБ)",
              samples.count, Double(samples.count) / sampleRate, peak, rms, 20 * log10(max(rms, 1e-9))))
 
+// TRACKS=1 — сохранить обе дорожки рядом с исходником, чтобы послушать.
+// SEPARATE=0 — без разделения, =p — только снять ударные, иначе полный разбор.
+let separationMode: SourceSeparator.Mode?
+switch ProcessInfo.processInfo.environment["SEPARATE"] {
+case "0": separationMode = nil; print("Режим: без разделения")
+case "p": separationMode = .percussionOnly; print("Режим: только снятие ударных")
+default: separationMode = .full; print("Режим: ударные + отделение мелодии")
+}
+
+// Подбор параметров разделения: REPET_K / REPET_EXP / REPET_FLOOR.
+let env = ProcessInfo.processInfo.environment
+if let k = env["REPET_K"].flatMap(Int.init) { SourceSeparator.similarFrames = k }
+if let e = env["REPET_EXP"].flatMap(Float.init) { SourceSeparator.maskExponent = e }
+if let f = env["REPET_FLOOR"].flatMap(Float.init) { SourceSeparator.maskFloor = f }
+
+if ProcessInfo.processInfo.environment["TRACKS"] == "1" {
+    let started = Date()
+    let separated = SourceSeparator.separate(samples: samples, sampleRate: sampleRate)
+    print(String(format: "Разделение заняло %.2f с", -started.timeIntervalSinceNow))
+
+    let base = isSynthetic
+        ? "\(NSTemporaryDirectory())/\(mode)"
+        : URL(fileURLWithPath: mode).deletingPathExtension().path
+    for (name, track) in [("accompaniment", separated.accompaniment), ("melody", separated.melody)] {
+        let url = URL(fileURLWithPath: "\(base)-\(name).caf")
+        guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate,
+                                         channels: 1, interleaved: false),
+              let file = try? AVAudioFile(forWriting: url, settings: format.settings,
+                                          commonFormat: .pcmFormatFloat32, interleaved: false),
+              let buffer = AVAudioPCMBuffer(pcmFormat: format,
+                                            frameCapacity: AVAudioFrameCount(track.count)) else { continue }
+        buffer.frameLength = AVAudioFrameCount(track.count)
+        track.withUnsafeBufferPointer { source in
+            buffer.floatChannelData![0].update(from: source.baseAddress!, count: track.count)
+        }
+        try? file.write(from: buffer)
+        print("Дорожка: \(url.path)")
+    }
+}
+
 var chordOptions = ChordRecognizer.Options.beatSynchronous
 if let penalty = ProcessInfo.processInfo.environment["PENALTY"].flatMap(Float.init) {
     chordOptions.changePenalty = penalty
     print("Штраф за смену аккорда: \(penalty)")
 }
-let result = SongAnalyzer.analyze(samples: samples, sampleRate: sampleRate, chordOptions: chordOptions)
+let analysisStarted = Date()
+let result = SongAnalyzer.analyze(samples: samples, sampleRate: sampleRate,
+                                  chordOptions: chordOptions, separation: separationMode)
+print(String(format: "Анализ занял %.2f с", -analysisStarted.timeIntervalSinceNow))
 
 print("")
 print(String(format: "BPM: %.1f (уверенность %.2f)", result.bpm, result.tempoConfidence))
@@ -120,6 +163,17 @@ if let first = result.bars.first {
         result.bars.contains { abs($0.start - change) < 0.12 }
     }
     print("Смен аккордов: \(changes.count), из них на границе такта: \(onGrid.count)")
+
+    // Две метрики качества: сколько долей вообще получили аккорд и сколько тактов
+    // держатся под одним аккордом. По ним и сравниваем режимы разделения.
+    let allBeats = result.bars.flatMap { $0.beatChords }
+    let named = allBeats.filter { !$0.isNone }.count
+    let steady = result.bars.filter { bar in
+        !(bar.beatChords.first?.isNone ?? true) && bar.beatChords.allSatisfy { $0 == bar.beatChords[0] }
+    }.count
+    print(String(format: "ПОКРЫТИЕ: %d/%d долей с аккордом (%.0f%%); РОВНЫХ ТАКТОВ: %d/%d (%.0f%%)",
+                 named, allBeats.count, 100 * Double(named) / Double(max(1, allBeats.count)),
+                 steady, result.bars.count, 100 * Double(steady) / Double(max(1, result.bars.count))))
 }
 
 // MARK: - Диагностика хромы
