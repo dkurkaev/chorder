@@ -65,27 +65,6 @@ enum SongAnalyzer {
         )
     }
 
-    /// Быстрый разбор для лайв-индикатора: аккорд последнего окна + текущий темп.
-    static func quickAnalyze(samples: [Float], sampleRate: Double) -> (chord: ChordLabel, confidence: Float, bpm: Double) {
-        let chroma = ChromaExtractor.chromagram(samples: samples, sampleRate: sampleRate)
-        guard !chroma.isEmpty else { return (.none, 0, 0) }
-
-        // Усредняем последние ~1.5 секунды хромы — устойчивее одного кадра.
-        let window = max(1, Int(1.5 / max(0.01, chroma.count > 1 ? chroma[1].time - chroma[0].time : 0.1)))
-        let tail = chroma.suffix(window)
-        var average = [Float](repeating: 0, count: 12)
-        for frame in tail {
-            for i in 0..<12 { average[i] += frame.values[i] }
-        }
-        for i in 0..<12 { average[i] /= Float(tail.count) }
-
-        let best = ChordRecognizer.bestLabel(for: average)
-
-        let (envelope, rate) = BeatTracker.onsetEnvelope(samples: samples, sampleRate: sampleRate)
-        let tempo = BeatTracker.estimateTempo(envelope: envelope, rate: rate)
-        return (best.label, best.confidence, (tempo.bpm * 10).rounded() / 10)
-    }
-
     // MARK: - Такты
 
     static func buildBars(

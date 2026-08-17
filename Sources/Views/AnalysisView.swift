@@ -1,12 +1,10 @@
 import SwiftUI
 
-/// Экран результата — общий для свежего разбора и для сохранённой записи.
+/// Экран результата сохранённой записи.
 struct AnalysisView: View {
     let result: AnalysisResult
     let audioURL: URL?
-    @State var title: String
-    var onSave: ((String) -> Void)?
-    var onDiscard: (() -> Void)?
+    let title: String
 
     @StateObject private var player = AudioPlayerController()
 
@@ -20,20 +18,11 @@ struct AnalysisView: View {
                 if !result.chords.isEmpty { segmentsCard }
             }
             .padding(16)
+            .padding(.bottom, 60)   // чтобы последняя карточка не пряталась под таб-баром
         }
         .background(Theme.background.ignoresSafeArea())
-        .navigationTitle(onSave == nil ? title : "Результат")
+        .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            if let onSave {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Не сохранять") { onDiscard?() }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Сохранить") { onSave(title) }
-                }
-            }
-        }
         .onAppear { player.load(url: audioURL) }
         .onDisappear { player.stop() }
     }
@@ -42,12 +31,6 @@ struct AnalysisView: View {
 
     private var summaryCard: some View {
         VStack(alignment: .leading, spacing: 14) {
-            if onSave != nil {
-                TextField("Название", text: $title)
-                    .textFieldStyle(.plain)
-                    .font(.headline)
-                    .foregroundStyle(Theme.textPrimary)
-            }
             HStack(alignment: .top, spacing: 0) {
                 statistic(value: result.bpm > 0 ? String(format: "%.0f", result.bpm) : "—", caption: "BPM")
                 Divider().frame(height: 40).overlay(Theme.textSecondary.opacity(0.3))
@@ -97,17 +80,46 @@ struct AnalysisView: View {
             }
             .buttonStyle(.plain)
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text(currentChord.isNone ? "—" : currentChord.name)
-                    .font(.system(size: 28, weight: .bold, design: .rounded))
-                    .foregroundStyle(Theme.color(for: currentChord))
-                Text("\(player.currentTime.asTimecode) / \(result.duration.asTimecode)")
-                    .font(.caption)
-                    .foregroundStyle(Theme.textSecondary)
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(currentChord.isNone ? "Прослушать фрагмент" : currentChord.name)
+                        .font(currentChord.isNone
+                              ? .system(size: 16, weight: .medium)
+                              : .system(size: 24, weight: .bold, design: .rounded))
+                        .foregroundStyle(currentChord.isNone
+                                         ? Theme.textPrimary
+                                         : Theme.color(for: currentChord))
+                    Spacer()
+                    Text("\(player.currentTime.asDurationLabel) / \(result.duration.asDurationLabel)")
+                        .font(.caption)
+                        .monospacedDigit()
+                        .foregroundStyle(Theme.textSecondary)
+                }
+                progressBar
             }
-            Spacer()
         }
         .cardStyle()
+    }
+
+    private var progressBar: some View {
+        GeometryReader { geometry in
+            let fraction = result.duration > 0
+                ? min(1, max(0, player.currentTime / result.duration))
+                : 0
+            ZStack(alignment: .leading) {
+                Capsule().fill(Theme.surfaceHigh)
+                Capsule().fill(Theme.accent)
+                    .frame(width: geometry.size.width * fraction)
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0).onEnded { value in
+                    guard geometry.size.width > 0 else { return }
+                    player.seek(to: Double(value.location.x / geometry.size.width) * result.duration)
+                }
+            )
+        }
+        .frame(height: 5)
     }
 
     private var barsCard: some View {

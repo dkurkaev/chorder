@@ -9,7 +9,6 @@ final class AudioRecorder: NSObject, ObservableObject {
     enum State: Equatable {
         case idle
         case recording
-        case analyzing
         case denied
         case failed(String)
     }
@@ -17,13 +16,8 @@ final class AudioRecorder: NSObject, ObservableObject {
     @Published private(set) var state: State = .idle
     @Published private(set) var level: Float = 0          // 0…1, сглаженный RMS
     @Published private(set) var elapsed: Double = 0
-    @Published private(set) var liveChord: ChordLabel = .none
-    @Published private(set) var liveConfidence: Float = 0
-    @Published private(set) var liveBPM: Double = 0
-    /// Уровни частотных полос (0…1) для визуализации, снизу вверх по частоте.
+    /// Уровни частотных полос (0…1) для визуализации, по возрастанию частоты.
     @Published private(set) var spectrum: [Float] = Array(repeating: 0, count: AudioRecorder.bandCount)
-    /// Текущая хрома (12 классов высоты, 0…1) — подсветка нот аккорда.
-    @Published private(set) var chroma: [Float] = Array(repeating: 0, count: 12)
 
     static let bandCount = 40
 
@@ -50,12 +44,10 @@ final class AudioRecorder: NSObject, ObservableObject {
         fftSize: Self.visualFFTSize, sampleRate: Self.sampleRate, count: Self.bandCount
     )
     private var smoothedBands = [Float](repeating: 0, count: AudioRecorder.bandCount)
-    private var smoothedChroma = [Float](repeating: 0, count: 12)
     private var lastVisualUpdate: CFAbsoluteTime = 0
 
-    private let analysisQueue = DispatchQueue(label: "com.chorder.analysis", qos: .userInitiated)
-    private var liveTimer: Timer?
-    private var isLiveAnalysisRunning = false
+    private let fileQueue = DispatchQueue(label: "com.chorder.recording", qos: .userInitiated)
+    private var startRequested = false
 
     var isRecording: Bool { state == .recording }
 
@@ -77,8 +69,11 @@ final class AudioRecorder: NSObject, ObservableObject {
 
     func start() {
         guard state != .recording else { return }
+        startRequested = true
         requestPermission { [weak self] granted in
             guard let self else { return }
+            // Кнопку могли отпустить, пока висел системный запрос доступа.
+            guard self.startRequested else { return }
             guard granted else {
                 self.state = .denied
                 return
@@ -105,12 +100,7 @@ final class AudioRecorder: NSObject, ObservableObject {
 
         elapsed = 0
         spectrum = [Float](repeating: 0, count: Self.bandCount)
-        chroma = [Float](repeating: 0, count: 12)
         smoothedBands = [Float](repeating: 0, count: Self.bandCount)
-        smoothedChroma = [Float](repeating: 0, count: 12)
-        liveChord = .none
-        liveBPM = 0
-        liveConfidence = 0
 
         let input = engine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
@@ -127,7 +117,6 @@ final class AudioRecorder: NSObject, ObservableObject {
 
         engine.prepare()
         try engine.start()
-        startLiveAnalysis()
     }
 
     private func process(buffer: AVAudioPCMBuffer, inputFormat: AVAudioFormat) {
@@ -231,93 +220,45 @@ final class AudioRecorder: NSObject, ObservableObject {
         }
         smoothedBands = levels
 
-        var chromaValues = [Float](repeating: 0, count: 12)
-        let binHz = Self.sampleRate / Double(Self.visualFFTSize)
-        for bin in 1..<spectrum.count {
-            let frequency = Double(bin) * binHz
-            guard frequency >= 65, frequency <= 2100 else { continue }
-            let midi = 69 + 12 * log2(frequency / 440)
-            let pitchClass = ((Int(midi.rounded()) % 12) + 12) % 12
-            chromaValues[pitchClass] += spectrum[bin]
-        }
-        let chromaPeak = chromaValues.max() ?? 0
-        if chromaPeak > 0 {
-            for i in 0..<12 { chromaValues[i] = min(1, chromaValues[i] / chromaPeak) }
-        }
-        for i in 0..<12 {
-            smoothedChroma[i] = chromaValues[i] > smoothedChroma[i]
-                ? chromaValues[i]
-                : smoothedChroma[i] * 0.8 + chromaValues[i] * 0.2
-        }
-
         let publishedSpectrum = smoothedBands
-        let publishedChroma = smoothedChroma
         DispatchQueue.main.async { [weak self] in
             self?.spectrum = publishedSpectrum
-            self?.chroma = publishedChroma
         }
     }
 
-    // MARK: - Живой разбор
+    // MARK: - Остановка
 
-    private func startLiveAnalysis() {
-        liveTimer?.invalidate()
-        liveTimer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: true) { [weak self] _ in
-            self?.runLiveAnalysis()
-        }
-    }
-
-    private func runLiveAnalysis() {
-        guard !isLiveAnalysisRunning else { return }
-        let window = Int(Self.sampleRate * 5)
-        lock.lock()
-        let snapshot = Array(samples.suffix(window))
-        lock.unlock()
-        guard snapshot.count > Int(Self.sampleRate) else { return }
-
-        isLiveAnalysisRunning = true
-        analysisQueue.async { [weak self] in
-            guard let self else { return }
-            let result = SongAnalyzer.quickAnalyze(samples: snapshot, sampleRate: Self.sampleRate)
-            DispatchQueue.main.async {
-                self.liveChord = result.chord
-                self.liveConfidence = result.confidence
-                if result.bpm > 0 { self.liveBPM = result.bpm }
-                self.isLiveAnalysisRunning = false
-            }
-        }
-    }
-
-    // MARK: - Остановка и разбор
-
-    /// Останавливает запись, сохраняет аудио и возвращает полный разбор.
-    func stopAndAnalyze(completion: @escaping (AnalysisResult, URL?) -> Void) {
-        liveTimer?.invalidate()
-        liveTimer = nil
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    /// Останавливает запись и сохраняет аудио в файл.
+    /// Разбор здесь не запускается — им занимается `AnalysisQueue` уже над сохранённой записью.
+    func stopAndSave(completion: @escaping (_ samples: [Float], _ url: URL?, _ duration: Double) -> Void) {
+        startRequested = false
+        stopEngine()
 
         lock.lock()
         let captured = samples
         lock.unlock()
 
-        state = .analyzing
         level = 0
+        spectrum = [Float](repeating: 0, count: Self.bandCount)
+        let duration = Double(captured.count) / Self.sampleRate
 
-        analysisQueue.async { [weak self] in
-            let result = SongAnalyzer.analyze(samples: captured, sampleRate: Self.sampleRate)
+        fileQueue.async { [weak self] in
             let url = AudioFileStore.shared.write(samples: captured, sampleRate: Self.sampleRate)
             DispatchQueue.main.async {
                 self?.state = .idle
-                completion(result, url)
+                completion(captured, url, duration)
             }
         }
     }
 
+    private func stopEngine() {
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+
     func cancel() {
-        liveTimer?.invalidate()
-        liveTimer = nil
+        startRequested = false
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
@@ -328,6 +269,5 @@ final class AudioRecorder: NSObject, ObservableObject {
         level = 0
         elapsed = 0
         spectrum = [Float](repeating: 0, count: Self.bandCount)
-        chroma = [Float](repeating: 0, count: 12)
     }
 }

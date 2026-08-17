@@ -29,6 +29,12 @@ extension View {
 }
 
 extension Double {
+    /// Длительность в списке записей: «0:14».
+    var asDurationLabel: String {
+        let total = Int(max(0, self).rounded())
+        return String(format: "%d:%02d", total / 60, total % 60)
+    }
+
     var asTimecode: String {
         let total = max(0, self)
         let minutes = Int(total) / 60

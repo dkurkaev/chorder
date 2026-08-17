@@ -1,64 +1,72 @@
 import SwiftUI
 
-/// Живой спектр: столбики по логарифмической шкале частот.
-struct SpectrumView: View {
+/// Круговой спектр: полосы расходятся лучами от кнопки записи.
+/// Низкие частоты сверху, дальше по часовой стрелке до верхних.
+struct RadialSpectrumView: View {
     let levels: [Float]
     var isActive: Bool
+    /// Радиус кольца, от которого растут лучи.
+    var innerRadius: CGFloat = 92
+    /// Максимальная длина луча.
+    var maxLength: CGFloat = 52
 
     var body: some View {
-        GeometryReader { geometry in
+        Canvas { context, size in
+            let center = CGPoint(x: size.width / 2, y: size.height / 2)
             let count = max(1, levels.count)
-            let spacing: CGFloat = 3
-            let width = max(2, (geometry.size.width - spacing * CGFloat(count - 1)) / CGFloat(count))
-            HStack(alignment: .bottom, spacing: spacing) {
-                ForEach(0..<count, id: \.self) { index in
-                    let level = CGFloat(max(0.015, min(1, levels[index])))
-                    RoundedRectangle(cornerRadius: width / 2, style: .continuous)
-                        .fill(
-                            LinearGradient(
-                                colors: [Theme.accent, Theme.accentWarm],
-                                startPoint: .bottom,
-                                endPoint: .top
-                            )
-                        )
-                        .opacity(isActive ? 0.55 + 0.45 * level : 0.22)
-                        .frame(width: width, height: max(3, geometry.size.height * level))
-                }
+            let barWidth = max(2.5, (2 * .pi * innerRadius) / CGFloat(count) * 0.55)
+
+            // Опорное кольцо — чтобы визуализация читалась и в тишине.
+            let ring = Path(ellipseIn: CGRect(
+                x: center.x - innerRadius, y: center.y - innerRadius,
+                width: innerRadius * 2, height: innerRadius * 2
+            ))
+            context.stroke(ring, with: .color(Theme.accent.opacity(isActive ? 0.22 : 0.12)), lineWidth: 1)
+
+            for index in 0..<count {
+                let level = CGFloat(max(0.02, min(1, levels[index])))
+                let angle = -CGFloat.pi / 2 + (CGFloat(index) / CGFloat(count)) * 2 * .pi
+                let direction = CGPoint(x: cos(angle), y: sin(angle))
+
+                let from = CGPoint(
+                    x: center.x + direction.x * innerRadius,
+                    y: center.y + direction.y * innerRadius
+                )
+                let to = CGPoint(
+                    x: center.x + direction.x * (innerRadius + maxLength * level),
+                    y: center.y + direction.y * (innerRadius + maxLength * level)
+                )
+
+                var path = Path()
+                path.move(to: from)
+                path.addLine(to: to)
+
+                // Цвет от холодного к тёплому по мере роста частоты.
+                let hueShift = Double(index) / Double(count)
+                let color = Theme.accent.mix(with: Theme.accentWarm, by: hueShift)
+                context.stroke(
+                    path,
+                    with: .color(color.opacity(isActive ? 0.45 + 0.55 * Double(level) : 0.18)),
+                    style: StrokeStyle(lineWidth: barWidth, lineCap: .round)
+                )
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-            .animation(.linear(duration: 0.06), value: levels)
         }
+        .animation(.linear(duration: 0.06), value: levels)
+        .allowsHitTesting(false)
     }
 }
 
-/// Двенадцать классов высоты: видно, какие ноты сейчас звучат и из чего собран аккорд.
-struct ChromaStripView: View {
-    let values: [Float]
-    let chord: ChordLabel
-
-    private var chordTones: Set<Int> {
-        guard let root = chord.root, let quality = chord.quality else { return [] }
-        return Set(quality.intervals.map { (root + $0) % 12 })
-    }
-
-    var body: some View {
-        HStack(spacing: 4) {
-            ForEach(0..<12, id: \.self) { pitchClass in
-                let level = CGFloat(max(0, min(1, values.indices.contains(pitchClass) ? values[pitchClass] : 0)))
-                let isChordTone = chordTones.contains(pitchClass)
-                VStack(spacing: 4) {
-                    RoundedRectangle(cornerRadius: 4, style: .continuous)
-                        .fill(isChordTone ? Theme.accentWarm : Theme.accent)
-                        .opacity(0.25 + 0.75 * level)
-                        .frame(height: 6 + 22 * level)
-                    Text(ChordLabel.pitchNames[pitchClass])
-                        .font(.system(size: 9, weight: isChordTone ? .bold : .regular, design: .rounded))
-                        .foregroundStyle(isChordTone ? Theme.accentWarm : Theme.textSecondary)
-                }
-                .frame(maxWidth: .infinity, alignment: .bottom)
-            }
-        }
-        .frame(height: 44, alignment: .bottom)
-        .animation(.linear(duration: 0.08), value: values)
+private extension Color {
+    /// Линейное смешивание в sRGB — Color.mix доступен только с iOS 18.
+    func mix(with other: Color, by amount: Double) -> Color {
+        let lhs = UIColor(self).cgColor.components ?? [0, 0, 0, 1]
+        let rhs = UIColor(other).cgColor.components ?? [0, 0, 0, 1]
+        guard lhs.count >= 3, rhs.count >= 3 else { return self }
+        let t = max(0, min(1, amount))
+        return Color(
+            red: Double(lhs[0]) * (1 - t) + Double(rhs[0]) * t,
+            green: Double(lhs[1]) * (1 - t) + Double(rhs[1]) * t,
+            blue: Double(lhs[2]) * (1 - t) + Double(rhs[2]) * t
+        )
     }
 }
