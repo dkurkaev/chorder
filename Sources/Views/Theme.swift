@@ -1,6 +1,10 @@
 import SwiftUI
 
 enum Theme {
+    /// Компоненты акцентных цветов — нужны для интерполяции без UIColor.
+    static let accentComponents: (red: Double, green: Double, blue: Double) = (0.42, 0.78, 0.98)
+    static let accentWarmComponents: (red: Double, green: Double, blue: Double) = (0.98, 0.60, 0.35)
+
     static let background = Color(red: 0.06, green: 0.07, blue: 0.10)
     static let surface = Color(red: 0.11, green: 0.12, blue: 0.16)
     static let surfaceHigh = Color(red: 0.16, green: 0.17, blue: 0.22)

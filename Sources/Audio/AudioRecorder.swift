@@ -239,6 +239,7 @@ final class AudioRecorder: NSObject, ObservableObject {
         lock.unlock()
 
         level = 0
+        elapsed = 0
         spectrum = [Float](repeating: 0, count: Self.bandCount)
         let duration = Double(captured.count) / Self.sampleRate
 
@@ -256,6 +257,31 @@ final class AudioRecorder: NSObject, ObservableObject {
         engine.stop()
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
+
+    #if DEBUG
+    /// Прогон визуализации без микрофона: `-simulateSpectrum` в аргументах запуска.
+    /// Нужен, чтобы смотреть оформление экрана записи на симуляторе.
+    func startSimulation() {
+        state = .recording
+        var phase: Double = 0
+        Timer.scheduledTimer(withTimeInterval: 1.0 / 24, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            phase += 0.12
+            var levels = [Float](repeating: 0, count: Self.bandCount)
+            for i in 0..<Self.bandCount {
+                let position = Double(i) / Double(Self.bandCount)
+                // Спад к верхним частотам + несколько «дышащих» формант.
+                let tilt = pow(1 - position, 1.4)
+                let wobble = 0.55 + 0.45 * sin(phase * 1.7 + position * 9)
+                let accent = 0.35 * sin(phase * 0.9 + position * 22)
+                levels[i] = Float(max(0.02, min(1, tilt * wobble + accent * tilt)))
+            }
+            self.spectrum = levels
+            self.level = 0.55 + 0.35 * Float(sin(phase * 1.3))
+            self.elapsed += 1.0 / 24
+        }
+    }
+    #endif
 
     func cancel() {
         startRequested = false

@@ -7,7 +7,7 @@ struct RecordView: View {
     @EnvironmentObject private var router: AppRouter
     @StateObject private var recorder = AudioRecorder()
 
-    @State private var toast: ToastMessage?
+    @State private var banner: BannerMessage?
     @State private var isPressing = false
     @State private var dismissWorkItem: DispatchWorkItem?
 
@@ -16,76 +16,123 @@ struct RecordView: View {
             ZStack(alignment: .top) {
                 Theme.background.ignoresSafeArea()
 
-                VStack(spacing: 24) {
+                VStack(spacing: 20) {
                     header
                     Spacer(minLength: 0)
                     recorderDial
-                    timer
                     Spacer(minLength: 0)
-                    hint
+                    timer
+                    problem
                 }
-                .padding(24)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 16)
 
-                if let toast {
-                    ToastView(message: toast) {
-                        if let recordID = toast.recordID {
-                            dismissToast()
+                if let banner {
+                    BannerView(
+                        message: banner,
+                        onTap: {
+                            guard let recordID = banner.recordID else { return }
+                            dismissBanner()
                             router.open(recordID: recordID)
+                        },
+                        onDismiss: { dismissBanner() },
+                        onDragChanged: { isDragging in
+                            // Пока баннер держат пальцем, автоскрытие не срабатывает.
+                            if isDragging {
+                                dismissWorkItem?.cancel()
+                            } else {
+                                scheduleDismiss(for: banner)
+                            }
                         }
-                    }
-                    .padding(.horizontal, 20)
-                    .transition(.move(edge: .top).combined(with: .opacity))
-                    .zIndex(1)
+                    )
+                    .padding(.horizontal, 16)
+                    .transition(.banner)
+                    .zIndex(10)
                 }
             }
             .navigationBarHidden(true)
         }
         .onAppear {
             recorder.onMaxDurationReached = { stop() }
+            #if DEBUG
+            if CommandLine.arguments.contains("-simulateSpectrum") {
+                recorder.startSimulation()
+            }
+            #endif
         }
     }
 
     // MARK: - Части экрана
 
     private var header: some View {
-        VStack(spacing: 6) {
-            Text("Chorder")
-                .font(.system(size: 30, weight: .bold, design: .rounded))
-                .foregroundStyle(Theme.textPrimary)
-            Text("Поднеси телефон к музыке")
-                .font(.subheadline)
-                .foregroundStyle(Theme.textSecondary)
-        }
+        Text("Chorder")
+            .font(.system(size: 30, weight: .bold, design: .rounded))
+            .foregroundStyle(Theme.textPrimary)
     }
 
-    /// Кнопка записи в кольце живого спектра.
+    /// Главный элемент экрана: крупная кнопка в живой пульсирующей форме.
     private var recorderDial: some View {
-        ZStack {
-            RadialSpectrumView(levels: recorder.spectrum, isActive: recorder.isRecording)
-                .frame(width: 300, height: 300)
-            recordButton
+        GeometryReader { geometry in
+            let side = min(geometry.size.width, geometry.size.height)
+            let buttonSize = side * 0.62
+
+            ZStack {
+                PulseVisualizerView(
+                    levels: recorder.spectrum,
+                    isActive: recorder.isRecording,
+                    innerRadius: buttonSize / 2 + 10,
+                    maxLength: (side - buttonSize) / 2 - 14,
+                    tint: recorder.isRecording ? Theme.accentWarm : Theme.accent,
+                    tintComponents: recorder.isRecording
+                        ? Theme.accentWarmComponents
+                        : Theme.accentComponents
+                )
+                recordButton(size: buttonSize)
+            }
+            .frame(width: geometry.size.width, height: geometry.size.height)
         }
-        .frame(width: 300, height: 300)
+        .aspectRatio(1, contentMode: .fit)
+        .frame(maxWidth: 380)
     }
 
     /// Запись идёт, пока кнопка удерживается.
-    private var recordButton: some View {
+    private func recordButton(size: CGFloat) -> some View {
         ZStack {
             Circle()
-                .fill(Theme.accent.opacity(0.16))
-                .frame(width: 160, height: 160)
-                .scaleEffect(1 + CGFloat(recorder.level) * 0.18)
-                .animation(.easeOut(duration: 0.12), value: recorder.level)
-            Circle()
-                .fill(recorder.isRecording ? Theme.accentWarm : Theme.accent)
-                .frame(width: 116, height: 116)
+                .fill(
+                    RadialGradient(
+                        colors: recorder.isRecording
+                            ? [Theme.accentWarm, Theme.accentWarm.opacity(0.55)]
+                            : [Theme.accent, Theme.accent.opacity(0.55)],
+                        center: UnitPoint(x: 0.32, y: 0.26),
+                        startRadius: 0,
+                        endRadius: size * 0.95
+                    )
+                )
+                .overlay(
+                    Circle().strokeBorder(
+                        LinearGradient(
+                            colors: [.white.opacity(0.35), .white.opacity(0.05)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        lineWidth: 1
+                    )
+                )
+                .shadow(
+                    color: (recorder.isRecording ? Theme.accentWarm : Theme.accent).opacity(0.38),
+                    radius: 26
+                )
+
             Image(systemName: recorder.isRecording ? "waveform" : "mic.fill")
-                .font(.system(size: 38, weight: .semibold))
-                .foregroundStyle(.black.opacity(0.85))
+                .font(.system(size: size * 0.26, weight: .medium))
+                .foregroundStyle(Color(red: 0.05, green: 0.06, blue: 0.09).opacity(0.9))
                 .symbolEffect(.variableColor.iterative, isActive: recorder.isRecording)
         }
-        .scaleEffect(isPressing ? 0.94 : 1)
+        .frame(width: size, height: size)
+        .scaleEffect(isPressing ? 0.96 : 1)
         .animation(.spring(response: 0.25, dampingFraction: 0.7), value: isPressing)
+        .animation(.easeInOut(duration: 0.2), value: recorder.isRecording)
         .contentShape(Circle())
         .gesture(
             DragGesture(minimumDistance: 0)
@@ -103,29 +150,32 @@ struct RecordView: View {
 
     private var timer: some View {
         Text(recorder.elapsed.asTimecode)
-            .font(.system(size: 30, weight: .semibold, design: .rounded))
+            .font(.system(size: 60, weight: .semibold, design: .rounded))
             .monospacedDigit()
-            .foregroundStyle(recorder.isRecording ? Theme.textPrimary : Theme.textSecondary)
+            .foregroundStyle(Theme.textPrimary)
+            .opacity(recorder.isRecording ? 1 : 0)
+            .animation(.easeInOut(duration: 0.2), value: recorder.isRecording)
+            .frame(height: 68)
     }
 
-    private var hint: some View {
-        Group {
-            switch recorder.state {
-            case .denied:
-                Text("Нет доступа к микрофону. Включи его в Настройках → Chorder.")
-                    .foregroundStyle(Theme.accentWarm)
-            case .failed(let message):
-                Text(message).foregroundStyle(Theme.accentWarm)
-            case .recording:
-                Text("Слушаю… отпусти, когда хватит")
-            default:
-                Text("Держи кнопку, пока играет музыка")
-            }
+    /// Показывается только когда есть что сказать по делу.
+    @ViewBuilder private var problem: some View {
+        switch recorder.state {
+        case .denied:
+            problemText("Нет доступа к микрофону — включи его в Настройках")
+        case .failed(let message):
+            problemText(message)
+        default:
+            Color.clear.frame(height: 20)
         }
-        .font(.footnote)
-        .multilineTextAlignment(.center)
-        .foregroundStyle(Theme.textSecondary)
-        .frame(height: 40)
+    }
+
+    private func problemText(_ text: String) -> some View {
+        Text(text)
+            .font(.footnote)
+            .multilineTextAlignment(.center)
+            .foregroundStyle(Theme.accentWarm)
+            .frame(height: 20)
     }
 
     // MARK: - Действия
@@ -146,10 +196,11 @@ struct RecordView: View {
         recorder.stopAndSave { samples, url, duration in
             guard duration > 1 else {
                 AudioFileStore.shared.delete(fileName: url?.lastPathComponent)
-                show(ToastMessage(
-                    icon: "exclamationmark.triangle",
+                show(BannerMessage(
+                    icon: "exclamationmark.triangle.fill",
                     title: "Слишком короткий фрагмент",
-                    subtitle: "Подержи кнопку хотя бы пару секунд"
+                    subtitle: "Подержи кнопку хотя бы пару секунд",
+                    isWarning: true
                 ))
                 return
             }
@@ -165,7 +216,7 @@ struct RecordView: View {
                 container: modelContext.container
             )
 
-            show(ToastMessage(
+            show(BannerMessage(
                 icon: "checkmark.circle.fill",
                 title: "Запись создана",
                 subtitle: "Разбираю аккорды и ритм — нажми, чтобы открыть",
@@ -174,23 +225,29 @@ struct RecordView: View {
         }
     }
 
-    private func show(_ message: ToastMessage) {
+    private func show(_ message: BannerMessage) {
         dismissWorkItem?.cancel()
-        withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
-            toast = message
+        withAnimation(.spring(response: 0.5, dampingFraction: 0.86)) {
+            banner = message
         }
+        scheduleDismiss(for: message)
+    }
+
+    private func scheduleDismiss(for message: BannerMessage) {
+        dismissWorkItem?.cancel()
         let work = DispatchWorkItem {
-            if toast?.id == message.id { dismissToast() }
+            guard banner?.id == message.id else { return }
+            dismissBanner()
         }
         dismissWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: work)
     }
 
-    private func dismissToast() {
+    private func dismissBanner() {
         dismissWorkItem?.cancel()
         dismissWorkItem = nil
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.9)) {
-            toast = nil
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.9)) {
+            banner = nil
         }
     }
 
@@ -199,51 +256,5 @@ struct RecordView: View {
         formatter.dateFormat = "d MMMM, HH:mm"
         formatter.locale = Locale(identifier: "ru_RU")
         return formatter.string(from: Date())
-    }
-}
-
-// MARK: - Уведомление
-
-struct ToastMessage: Equatable, Identifiable {
-    var id = UUID()
-    var icon: String
-    var title: String
-    var subtitle: String
-    var recordID: UUID?
-}
-
-struct ToastView: View {
-    let message: ToastMessage
-    var onTap: () -> Void
-
-    var body: some View {
-        Button(action: onTap) {
-            HStack(spacing: 12) {
-                Image(systemName: message.icon)
-                    .font(.system(size: 22))
-                    .foregroundStyle(Theme.accent)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(message.title)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(Theme.textPrimary)
-                    Text(message.subtitle)
-                        .font(.caption)
-                        .foregroundStyle(Theme.textSecondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .multilineTextAlignment(.leading)
-                }
-                Spacer(minLength: 0)
-                if message.recordID != nil {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(Theme.textSecondary)
-                }
-            }
-            .padding(14)
-            .background(Theme.surfaceHigh, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-            .shadow(color: .black.opacity(0.35), radius: 12, y: 4)
-        }
-        .buttonStyle(.plain)
-        .disabled(message.recordID == nil)
     }
 }

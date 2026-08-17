@@ -1,72 +1,84 @@
 import SwiftUI
 
-/// Круговой спектр: полосы расходятся лучами от кнопки записи.
-/// Низкие частоты сверху, дальше по часовой стрелке до верхних.
-struct RadialSpectrumView: View {
+/// Живой спектр вокруг кнопки записи: лучи, растущие прямо от её края.
+///
+/// Спектр отражается относительно вертикальной оси, поэтому картинка симметрична
+/// и не имеет стыка. В тишине лучей нет вообще — остаётся только кнопка.
+struct PulseVisualizerView: View {
     let levels: [Float]
     var isActive: Bool
-    /// Радиус кольца, от которого растут лучи.
-    var innerRadius: CGFloat = 92
-    /// Максимальная длина луча.
-    var maxLength: CGFloat = 52
+    /// Радиус, от которого начинаются лучи (край кнопки + зазор).
+    var innerRadius: CGFloat = 110
+    /// Длина луча на максимуме.
+    var maxLength: CGFloat = 64
+    /// Цвет у основания лучей — совпадает с цветом кнопки.
+    var tint: Color = Theme.accent
+    /// Компоненты этого же цвета: по ним считаются оттенки лучей без обращения к UIColor.
+    var tintComponents: (red: Double, green: Double, blue: Double) = Theme.accentComponents
 
     var body: some View {
         Canvas { context, size in
             let center = CGPoint(x: size.width / 2, y: size.height / 2)
-            let count = max(1, levels.count)
-            let barWidth = max(2.5, (2 * .pi * innerRadius) / CGFloat(count) * 0.55)
+            let values = spectrumRing()
+            let count = values.count
+            guard count > 3 else { return }
 
-            // Опорное кольцо — чтобы визуализация читалась и в тишине.
-            let ring = Path(ellipseIn: CGRect(
-                x: center.x - innerRadius, y: center.y - innerRadius,
-                width: innerRadius * 2, height: innerRadius * 2
-            ))
-            context.stroke(ring, with: .color(Theme.accent.opacity(isActive ? 0.22 : 0.12)), lineWidth: 1)
+            let circumference = 2 * CGFloat.pi * innerRadius
+            let barWidth = min(6, max(3, circumference / CGFloat(count) * 0.62))
 
             for index in 0..<count {
-                let level = CGFloat(max(0.02, min(1, levels[index])))
-                let angle = -CGFloat.pi / 2 + (CGFloat(index) / CGFloat(count)) * 2 * .pi
-                let direction = CGPoint(x: cos(angle), y: sin(angle))
+                let level = values[index]
+                guard level > 0.02 else { continue }
 
-                let from = CGPoint(
-                    x: center.x + direction.x * innerRadius,
-                    y: center.y + direction.y * innerRadius
-                )
-                let to = CGPoint(
-                    x: center.x + direction.x * (innerRadius + maxLength * level),
-                    y: center.y + direction.y * (innerRadius + maxLength * level)
-                )
+                let fraction = CGFloat(index) / CGFloat(count)
+                let angle = -CGFloat.pi / 2 + fraction * 2 * .pi
+                let direction = CGPoint(x: cos(angle), y: sin(angle))
+                let length = maxLength * level
 
                 var path = Path()
-                path.move(to: from)
-                path.addLine(to: to)
+                path.move(to: CGPoint(
+                    x: center.x + direction.x * innerRadius,
+                    y: center.y + direction.y * innerRadius
+                ))
+                path.addLine(to: CGPoint(
+                    x: center.x + direction.x * (innerRadius + length),
+                    y: center.y + direction.y * (innerRadius + length)
+                ))
 
-                // Цвет от холодного к тёплому по мере роста частоты.
-                let hueShift = Double(index) / Double(count)
-                let color = Theme.accent.mix(with: Theme.accentWarm, by: hueShift)
+                // Громкие полосы — светлее и плотнее, тихие уходят в фон.
+                let lift = 0.18 + 0.42 * Double(level)
+                let shade = Color(
+                    red: tintComponents.red + (1 - tintComponents.red) * lift,
+                    green: tintComponents.green + (1 - tintComponents.green) * lift,
+                    blue: tintComponents.blue + (1 - tintComponents.blue) * lift
+                )
                 context.stroke(
                     path,
-                    with: .color(color.opacity(isActive ? 0.45 + 0.55 * Double(level) : 0.18)),
+                    with: .color(shade.opacity(0.45 + 0.55 * Double(level))),
                     style: StrokeStyle(lineWidth: barWidth, lineCap: .round)
                 )
             }
         }
-        .animation(.linear(duration: 0.06), value: levels)
         .allowsHitTesting(false)
+        .animation(.linear(duration: 0.05), value: levels)
     }
-}
 
-private extension Color {
-    /// Линейное смешивание в sRGB — Color.mix доступен только с iOS 18.
-    func mix(with other: Color, by amount: Double) -> Color {
-        let lhs = UIColor(self).cgColor.components ?? [0, 0, 0, 1]
-        let rhs = UIColor(other).cgColor.components ?? [0, 0, 0, 1]
-        guard lhs.count >= 3, rhs.count >= 3 else { return self }
-        let t = max(0, min(1, amount))
-        return Color(
-            red: Double(lhs[0]) * (1 - t) + Double(rhs[0]) * t,
-            green: Double(lhs[1]) * (1 - t) + Double(rhs[1]) * t,
-            blue: Double(lhs[2]) * (1 - t) + Double(rhs[2]) * t
-        )
+    /// Спектр по кольцу: зеркальные половины + сглаживание соседей.
+    private func spectrumRing() -> [CGFloat] {
+        let count = max(3, levels.count)
+        var mirrored: [CGFloat] = []
+        mirrored.reserveCapacity(count * 2)
+        for index in 0..<count { mirrored.append(CGFloat(levels[index])) }
+        for index in stride(from: count - 1, through: 0, by: -1) { mirrored.append(CGFloat(levels[index])) }
+
+        guard mirrored.count > 2 else { return mirrored }
+        var smoothed = mirrored
+        let total = mirrored.count
+        for i in 0..<total {
+            let previous = mirrored[(i - 1 + total) % total]
+            let following = mirrored[(i + 1) % total]
+            smoothed[i] = previous * 0.25 + mirrored[i] * 0.5 + following * 0.25
+        }
+        return smoothed
     }
 }
