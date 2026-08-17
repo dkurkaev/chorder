@@ -6,6 +6,10 @@ enum SongAnalyzer {
 
     /// Штраф аккорду, которого нет в словаре чистых мест. Подбор — через Tools/DSPCheck.
     static var outsidePenalty: Float = 0.9
+    /// Насколько убедительнее знакомых должен быть незнакомый аккорд, чтобы его не штрафовали.
+    static var outsideAdvantage: Float = 1.05
+    /// Фора аккорду из словаря.
+    static var vocabularyBoost: Float = 1.08
     /// На сколько дешевеет переход, который песня действительно делает.
     static var transitionRelief: Float = 0.4
     /// Во сколько раз дороже переход, которого песня не делала. Единица — не штрафовать:
@@ -84,6 +88,8 @@ enum SongAnalyzer {
                 var refined = beatOptions
                 refined.vocabulary = model.vocabulary
                 refined.outsidePenalty = outsidePenalty
+                refined.outsideAdvantage = outsideAdvantage
+                refined.vocabularyBoost = vocabularyBoost
                 refined.transitions = useTransitions ? model.transitions : nil
                 refined.transitionRelief = transitionRelief
                 refined.unknownTransitionFactor = unknownTransitionFactor
@@ -104,7 +110,7 @@ enum SongAnalyzer {
                 beats: grid.beats, melody: melody, accompaniment: harmony, sampleRate: sampleRate
             )
             if let tightened = applyPhrase(
-                to: grid, beat: beat, duration: duration,
+                to: grid, beat: beat, chroma: chroma, duration: duration,
                 melodyShare: share, diagnostics: diagnostics
             ) {
                 // Фраза — подсказка, а не приговор: если после подгонки разбор стал хуже,
@@ -264,7 +270,7 @@ enum SongAnalyzer {
     /// словаря песни. Там, где хрома уверенно говорит своё, фразу не навязываем — иначе
     /// потеряются настоящие отклонения от неё.
     static func applyPhrase(
-        to grid: Grid, beat: BeatResult, duration: Double,
+        to grid: Grid, beat: BeatResult, chroma: [ChromaFrame], duration: Double,
         melodyShare: [Double], diagnostics: ((String) -> Void)?
     ) -> Grid? {
         guard !grid.bars.isEmpty, !melodyShare.isEmpty else { return nil }
@@ -305,52 +311,89 @@ enum SongAnalyzer {
             return uniform * 0.7 + quiet * 0.3
         }
 
-        guard var phrase = PhraseModel.find(
+        let opening = barChords.first(where: { !$0.isNone })
+        let phrases = PhraseModel.candidates(
             barChords: barChords, barSteadiness: steadiness, beatsPerBar: beat.beatsPerBar
-        ) else { return nil }
-        // Читаем фразу с того аккорда, с которого её играет запись, а не с произвольного
-        // места кольца.
-        if let opening = barChords.first(where: { !$0.isNone }) {
-            phrase = PhraseModel.rotated(phrase, toStartWith: opening)
+        ).map { candidate -> PhraseModel.Phrase in
+            // Читаем фразу с того аккорда, с которого её играет запись, а не с произвольного
+            // места кольца.
+            opening.map { PhraseModel.rotated(candidate, toStartWith: $0) } ?? candidate
         }
-        diagnostics?(String(
-            format: "Фраза: %@ (по %d долей, покрытие %.0f%%)",
-            phrase.chords.map { $0.name }.joined(separator: " – "),
-            phrase.beatsPerChord, phrase.support * 100
-        ))
+        guard !phrases.isEmpty else { return nil }
 
+        var best: Grid?
+        for phrase in phrases {
+            guard let candidate = fit(
+                phrase: phrase, to: grid, beat: beat, chroma: chroma, duration: duration,
+                melodyShare: melodyShare, diagnostics: diagnostics
+            ) else { continue }
+            if best == nil || candidate.score > best!.score {
+                best = candidate
+                diagnostics?(String(
+                    format: "Фраза: %@ (покрытие %.0f%%, оценка %.3f)",
+                    phrase.chords.map { $0.name }.joined(separator: " – "),
+                    phrase.support * 100, candidate.score
+                ))
+            }
+        }
+        return best
+    }
+
+    /// Подгоняет запись под одну конкретную фразу.
+    private static func fit(
+        phrase: PhraseModel.Phrase, to grid: Grid, beat: BeatResult, chroma: [ChromaFrame],
+        duration: Double, melodyShare: [Double], diagnostics: ((String) -> Void)? = nil
+    ) -> Grid? {
         let labels = beatChords(beats: grid.beats, chords: grid.chords, duration: duration)
         let start = grid.startBeat
         guard start < labels.count else { return nil }
         let tail = Array(labels[start...])
         guard let expected = PhraseModel.expectedChords(phrase: phrase, beatChords: tail) else {
-            diagnostics?("Фраза не согласуется с записью — оставляю как есть")
             return nil
         }
 
-        let vocabulary = Set(phrase.chords)
+        // Правки применяем по одному месту, а не всей записью разом.
+        //
+        // Фраза ошибается там же, где ошибается распознавание, и массовая подгонка тянет
+        // за собой чужие ошибки: одно верное исправление оплачивается двумя новыми. Поэтому
+        // каждое расхождение проверяется отдельно — принимаем только то, от чего разбор
+        // становится лучше по общей оценке.
         var corrected = labels
-        var changes = 0
-        for (offset, expectedChord) in expected.enumerated() {
-            let index = start + offset
-            guard index < corrected.count, corrected[index] != expectedChord else { continue }
-            // Правим там, где хроме верить нельзя: доля пустая, аккорд вообще не из фразы,
-            // либо поверх играет голос. Где солиста нет, а хрома уверенно говорит своё,
-            // фразу не навязываем — иначе потеряются настоящие отклонения от неё.
-            // Верим фразе там, где запись сама себе противоречит: доля пустая, аккорд не из
-            // фразы, либо он «залип» — тянется с прошлой доли, хотя фраза давно ушла дальше.
-            // Уверенно распознанный аккорд, который просто отличается от фразы, не трогаем:
-            // отклонения от неё бывают настоящими.
-            let isStuck = index > 0 && corrected[index] == corrected[index - 1]
-            guard corrected[index].isNone || !vocabulary.contains(corrected[index]) || isStuck else {
+        var accepted = 0
+        let frames = ChordRecognizer.beatFrames(
+            frames: chroma, beats: grid.beats, duration: duration
+        )
+        var currentScore = score(
+            of: corrected, grid: grid, beat: beat, duration: duration, frames: frames
+        )
+
+        let runs = phraseRuns(expected: expected, offset: start)
+        diagnostics?("Фраза ожидает: " + runs.prefix(12).map { from, to in
+            "\(from)-\(to):\(expected[from - start].name)"
+        }.joined(separator: " "))
+        for (from, to) in runs {
+            let observed = Array(corrected[from...to])
+            let target = expected[from - start]
+            guard observed.contains(where: { $0 != target }) else { continue }
+
+            var candidate = corrected
+            for index in from...to { candidate[index] = target }
+            removeSpecks(&candidate, from: start, minimumBeats: max(2, beat.beatsPerBar / 2))
+
+            let candidateScore = score(
+                of: candidate, grid: grid, beat: beat, duration: duration, frames: frames
+            )
+            guard candidateScore > currentScore else {
+                diagnostics?(String(format: "  отклонено %d-%d → %@ (%.4f vs %.4f)",
+                                    from, to, target.name, candidateScore, currentScore))
                 continue
             }
-            corrected[index] = expectedChord
-            changes += 1
+            corrected = candidate
+            currentScore = candidateScore
+            accepted += 1
         }
-        diagnostics?("Фраза поправила долей: \(changes)")
-        guard changes > 0 else { return nil }
-        removeSpecks(&corrected, from: start, minimumBeats: max(2, beat.beatsPerBar / 2))
+        diagnostics?("Фраза поправила мест: \(accepted)")
+        guard accepted > 0 else { return nil }
 
         let bars = buildBars(
             beats: grid.beats, beatsPerBar: beat.beatsPerBar,
@@ -361,6 +404,65 @@ enum SongAnalyzer {
             beats: grid.beats, chords: chords, bars: bars, startBeat: start,
             score: gridScore(bars: bars, beats: grid.beats)
         )
+    }
+
+    /// Границы участков, где фраза ожидает один и тот же аккорд.
+    private static func phraseRuns(expected: [ChordLabel], offset: Int) -> [(Int, Int)] {
+        var result: [(Int, Int)] = []
+        var index = 0
+        while index < expected.count {
+            var end = index
+            while end + 1 < expected.count && expected[end + 1] == expected[index] { end += 1 }
+            if !expected[index].isNone { result.append((offset + index, offset + end)) }
+            index = end + 1
+        }
+        return result
+    }
+
+    private static func score(
+        of labels: [ChordLabel], grid: Grid, beat: BeatResult,
+        duration: Double, frames: [ChromaFrame]
+    ) -> Double {
+        let bars = buildBars(
+            beats: grid.beats, beatsPerBar: beat.beatsPerBar,
+            startBeat: grid.startBeat, beatChords: labels, duration: duration
+        )
+        return gridScore(bars: bars, beats: grid.beats)
+            + 0.6 * consistency(labels: labels, frames: frames)
+    }
+
+    /// Насколько разбор согласован сам с собой.
+    ///
+    /// Записи не нужна разметка, чтобы себя проверить: доли, которые звучат одинаково,
+    /// обязаны получить один и тот же аккорд. Если один и тот же кусок фразы в одном месте
+    /// разобран как один аккорд, а в другом — как другой, кто-то из них точно неправ.
+    /// Мера ровности такта этого не видит, а эта — видит, и ей не нужен эталон.
+    static func consistency(labels: [ChordLabel], frames: [ChromaFrame], neighbours: Int = 5) -> Double {
+        let count = min(labels.count, frames.count)
+        guard count > neighbours * 2 else { return 0 }
+
+        var agreed = 0
+        var total = 0
+        for index in 0..<count where !labels[index].isNone {
+            // Ищем самые похожие по звучанию доли в других местах записи.
+            var best: [(similarity: Float, index: Int)] = []
+            for other in 0..<count where abs(other - index) > 4 && !labels[other].isNone {
+                var dot: Float = 0
+                for k in 0..<12 { dot += frames[index].values[k] * frames[other].values[k] }
+                if best.count < neighbours {
+                    best.append((dot, other))
+                    best.sort { $0.similarity < $1.similarity }
+                } else if dot > best[0].similarity {
+                    best[0] = (dot, other)
+                    best.sort { $0.similarity < $1.similarity }
+                }
+            }
+            for candidate in best {
+                total += 1
+                if labels[candidate.index] == labels[index] { agreed += 1 }
+            }
+        }
+        return total > 0 ? Double(agreed) / Double(total) : 0
     }
 
     /// Убирает вкрапления: аккорд, продержавшийся меньше положенного и не подхваченный
@@ -468,9 +570,35 @@ enum SongAnalyzer {
         )
     }
 
-    /// Оценка сетки: доля тактов, целиком лежащих под одним аккордом. Такт, в котором
-    /// аккорд меняется, — признак того, что мы делим музыку не там, где она делится.
-    /// Слишком дробная сетка отсекается приором на привычный темп.
+    /// Доля тактов, попавших в неправдоподобно длинные удержания аккорда.
+    ///
+    /// Гармонический шаг у песни свой, но он один: если почти везде аккорд держится такт,
+    /// а в одном месте — пять, это не музыка, а слипшийся разбор. Без такой проверки
+    /// «ровность тактов» награждает именно слипание, потому что внутри такта всё однородно.
+    static func stickiness(bars: [Bar]) -> Double {
+        guard !bars.isEmpty else { return 0 }
+        var lengths: [Int] = []
+        var index = 0
+        while index < bars.count {
+            var end = index
+            while end + 1 < bars.count,
+                  bars[end + 1].beatChords.first == bars[index].beatChords.first { end += 1 }
+            lengths.append(end - index + 1)
+            index = end + 1
+        }
+        guard lengths.count > 1 else { return 0 }
+        let median = lengths.sorted()[lengths.count / 2]
+        // Штраф пропорционален превышению: удержание вдвое дольше обычного подозрительно
+        // вдвое сильнее. Сравнение с медианой делает правило независимым от того, какой
+        // гармонический шаг у песни — такт, два или половина.
+        let excess = lengths.reduce(0) { $0 + max(0, $1 - median) }
+        return Double(excess) / Double(bars.count)
+    }
+
+    /// Оценка сетки: доля тактов, целиком лежащих под одним аккордом, минус штраф за
+    /// слипшиеся куски. Такт, в котором аккорд меняется, — признак того, что мы делим
+    /// музыку не там, где она делится; такт, повторяющийся пять раз подряд, — что разбор
+    /// потерял смену. Слишком дробная сетка отсекается приором на привычный темп.
     private static func gridScore(bars: [Bar], beats: [Double]) -> Double {
         guard !bars.isEmpty, beats.count > 1 else { return 0 }
         let steady = bars.filter { bar in
@@ -485,7 +613,10 @@ enum SongAnalyzer {
         // самая дробная сетка — в коротком такте аккорд не успевает смениться.
         let prior = exp(-0.5 * pow(log2(bpm / 120.0) / 1.1, 2))
 
-        return (Double(steady) / Double(bars.count) + 0.35 * Double(named) / Double(total)) * prior
+        let score = Double(steady) / Double(bars.count)
+            + 0.35 * Double(named) / Double(total)
+            - 1.2 * stickiness(bars: bars)
+        return score * prior
     }
 
     /// Сворачивает доли тактов обратно в отрезки аккордов: подряд идущие одинаковые

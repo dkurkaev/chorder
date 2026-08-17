@@ -38,6 +38,59 @@ enum PhraseModel {
     /// а часть проведений искажена, точных повторов может не оказаться вовсе. Зато период
     /// виден по совпадениям со сдвигом, а среди одинаковых по смыслу проведений всегда есть
     /// более чистое — его и берём за образец, вместо того чтобы усреднять с испорченными.
+    /// Несколько правдоподобных фраз — какая из них верна, решает уже итоговый разбор.
+    ///
+    /// Способы дополняют друг друга: частое окно надёжно там, где проведения повторяются
+    /// дословно, но пасует, если каждое из них чем-то испорчено; поиск по периоду работает
+    /// и в этом случае, зато сбивается на записях с сокращениями, где период «плавает».
+    static func candidates(
+        barChords: [ChordLabel], barSteadiness: [Double] = [], beatsPerBar: Int, maxLength: Int = 12
+    ) -> [Phrase] {
+        var result: [Phrase] = []
+        if let byPeriod = find(
+            barChords: barChords, barSteadiness: barSteadiness,
+            beatsPerBar: beatsPerBar, maxLength: maxLength
+        ) {
+            result.append(byPeriod)
+        }
+        result.append(contentsOf: frequentWindows(
+            barChords: barChords, beatsPerBar: beatsPerBar, maxLength: maxLength
+        ))
+
+        // Разные способы часто дают одну и ту же фразу — повторы ни к чему.
+        var seen: Set<String> = []
+        return result.filter { seen.insert(name(of: $0.chords)).inserted }
+    }
+
+    /// Самое частое дословное повторение — по одному кандидату на каждую длину.
+    private static func frequentWindows(
+        barChords: [ChordLabel], beatsPerBar: Int, maxLength: Int
+    ) -> [Phrase] {
+        let chords = barChords.filter { !$0.isNone }
+        guard chords.count >= 4 else { return [] }
+
+        var result: [Phrase] = []
+        for length in 2...min(maxLength, chords.count / 2) {
+            var counts: [[ChordLabel]: Int] = [:]
+            for start in 0...(chords.count - length) {
+                let window = Array(chords[start..<(start + length)])
+                guard Set(window).count > 1 else { continue }
+                counts[window, default: 0] += 1
+            }
+            // Обход словаря не упорядочен: при равном числе вхождений выбираем по имени,
+            // иначе разбор одной записи давал бы от запуска к запуску разный результат.
+            guard let best = counts
+                .map({ (window: $0.key, count: $0.value) })
+                .min(by: { ($0.count, name(of: $1.window)) > ($1.count, name(of: $0.window)) }),
+                best.count >= 2 else { continue }
+            result.append(Phrase(
+                chords: shortestPeriod(of: best.window), beatsPerChord: beatsPerBar,
+                support: Double(best.count * length) / Double(chords.count)
+            ))
+        }
+        return result
+    }
+
     static func find(
         barChords: [ChordLabel], barSteadiness: [Double] = [], beatsPerBar: Int, maxLength: Int = 12
     ) -> Phrase? {
@@ -48,8 +101,7 @@ enum PhraseModel {
             : [Double](repeating: 1, count: count)
 
         // Период: сдвиг, при котором запись больше всего похожа сама на себя.
-        var bestPeriod = 0
-        var bestAgreement = 0.0
+        var agreements: [(period: Int, value: Double)] = []
         for period in 2...min(maxLength, count / 2) {
             var matches = 0
             var total = 0
@@ -59,15 +111,16 @@ enum PhraseModel {
                 if barChords[index] == barChords[index + period] { matches += 1 }
             }
             guard total > 0 else { continue }
-            // Короткий период объясняет запись дешевле, поэтому при равном согласии
-            // предпочитаем его.
-            let agreement = Double(matches) / Double(total) - Double(period) * 1e-3
-            if agreement > bestAgreement {
-                bestAgreement = agreement
-                bestPeriod = period
-            }
+            agreements.append((period, Double(matches) / Double(total)))
         }
-        guard bestPeriod > 0, bestAgreement >= 0.5 else { return nil }
+        // Кратный период похож на себя не хуже исходного: если запись повторяется каждые
+        // четыре такта, она повторяется и каждые восемь. Берём самый короткий из тех, что
+        // объясняют запись почти так же хорошо, — длинный лишь склеивает проведения.
+        guard let peak = agreements.map({ $0.value }).max(), peak >= 0.5,
+              let chosen = agreements.filter({ $0.value >= peak * 0.95 }).min(by: { $0.period < $1.period })
+        else { return nil }
+        let bestPeriod = chosen.period
+        let bestAgreement = chosen.value
 
         // Проведения фразы — блоки длиной в период. Берём самый уверенно разобранный.
         var bestStart = 0
@@ -118,6 +171,7 @@ enum PhraseModel {
             for length in lengths where length <= count {
                 cost[length][j] = mismatch(beatChords, from: 0, count: length, chord: phrase.chords[j])
                     + shrinkPenalty(length: length, full: full)
+
                 back[length][j] = nil
             }
         }
@@ -129,6 +183,7 @@ enum PhraseModel {
                     let candidate = cost[t][j]
                         + mismatch(beatChords, from: t, count: length, chord: phrase.chords[next])
                         + shrinkPenalty(length: length, full: full)
+
                     if candidate < cost[t + length][next] {
                         cost[t + length][next] = candidate
                         back[t + length][next] = (t: t, j: j, length: length)
@@ -221,7 +276,9 @@ enum PhraseModel {
 
     /// Сжатие — приём законный, но редкий: без штрафа выравнивание начнёт кромсать фразу
     /// везде, где запись хоть немного не совпала.
+    static var shrinkCost = 0.75
+
     private static func shrinkPenalty(length: Int, full: Int) -> Double {
-        length == full ? 0 : 0.75
+        length == full ? 0 : shrinkCost
     }
 }

@@ -97,6 +97,9 @@ if let e = env["REPET_EXP"].flatMap(Float.init) { SourceSeparator.maskExponent =
 if let f = env["REPET_FLOOR"].flatMap(Float.init) { SourceSeparator.maskFloor = f }
 if let p = env["VOCAB_PEN"].flatMap(Float.init) { SongAnalyzer.outsidePenalty = p }
 if let r = env["TRANS_RELIEF"].flatMap(Float.init) { SongAnalyzer.transitionRelief = r }
+if let a = env["VOCAB_ADV"].flatMap(Float.init) { SongAnalyzer.outsideAdvantage = a }
+if let b = env["VOCAB_BOOST"].flatMap(Float.init) { SongAnalyzer.vocabularyBoost = b }
+if let c = env["SHRINK"].flatMap(Double.init) { PhraseModel.shrinkCost = c }
 if let u = env["TRANS_UNKNOWN"].flatMap(Float.init) { SongAnalyzer.unknownTransitionFactor = u }
 
 if ProcessInfo.processInfo.environment["TRACKS"] == "1" {
@@ -225,6 +228,7 @@ if let first = result.bars.first {
     print("Такты по аккордам: " + perChord.sorted { $0.value > $1.value }
         .map { "\($0.key)×\($0.value)" }.joined(separator: "  "))
 
+    print(String(format: "СЛИПШИХСЯ ТАКТОВ: %.0f%%", 100 * SongAnalyzer.stickiness(bars: result.bars)))
     print(String(format: "ПОКРЫТИЕ: %d/%d долей с аккордом (%.0f%%); РОВНЫХ ТАКТОВ: %d/%d (%.0f%%)",
                  named, allBeats.count, 100 * Double(named) / Double(max(1, allBeats.count)),
                  steady, result.bars.count, 100 * Double(steady) / Double(max(1, result.bars.count))))

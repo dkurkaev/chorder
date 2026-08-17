@@ -70,7 +70,8 @@ enum ChordRecognizer {
     /// Косинусная близость кадра ко всем 72 шаблонам.
     static func scores(
         for frame: [Float], key: KeyContext? = nil,
-        vocabulary: Set<Int>? = nil, vocabularyBoost: Float = 1.08, outsidePenalty: Float = 0.9
+        vocabulary: Set<Int>? = nil, vocabularyBoost: Float = 1.08,
+        outsidePenalty: Float = 0.9, outsideAdvantage: Float = 1.05
     ) -> [Float] {
         var normalized = frame
         normalizeL2(&normalized)
@@ -81,8 +82,24 @@ enum ChordRecognizer {
             for k in 0..<12 { dot += normalized[k] * template.vector[k] }
             var score = max(0, dot) * template.prior
             if let key, key.contains(template.label) { score *= key.boost }
-            if let vocabulary { score *= vocabulary.contains(i) ? vocabularyBoost : outsidePenalty }
             out[i] = score
+        }
+
+        if let vocabulary, !vocabulary.isEmpty {
+            // Словарь — это память о том, что песня уже играла, и она не должна закрывать
+            // дорогу тому, что звучит впервые. Поэтому аккорд вне словаря штрафуется
+            // только пока он не выигрывает у лучшего знакомого с запасом: слабое
+            // отклонение — скорее всего испорченная версия знакомого аккорда, а явное —
+            //новая гармония, которой словарь просто ещё не видел.
+            var bestKnown: Float = 0
+            for index in vocabulary where index < out.count { bestKnown = max(bestKnown, out[index]) }
+            for i in 0..<out.count {
+                if vocabulary.contains(i) {
+                    out[i] *= vocabularyBoost
+                } else if out[i] < bestKnown * outsideAdvantage {
+                    out[i] *= outsidePenalty
+                }
+            }
         }
         return out
     }
@@ -119,6 +136,9 @@ enum ChordRecognizer {
         var vocabulary: Set<Int>?
         var vocabularyBoost: Float = 1.08
         var outsidePenalty: Float = 0.9
+        /// Насколько убедительнее знакомых должен быть незнакомый аккорд, чтобы его
+        /// не штрафовали: иначе новая гармония не сможет прозвучать в первый раз.
+        var outsideAdvantage: Float = 1.05
         /// Какие смены аккордов песня действительно делает — снято с чистых мест.
         /// Ключ — индекс шаблона, значение — доли переходов из него (сумма 1).
         var transitions: [Int: [Int: Float]]?
@@ -140,6 +160,34 @@ enum ChordRecognizer {
             noChordScore: 0.72,
             silenceRatio: 0.08
         )
+    }
+
+    /// Хрома, усреднённая внутри каждой доли. Нужна не только для разбора: по ней видно,
+    /// какие доли звучат одинаково, а значит должны получить один и тот же аккорд.
+    static func beatFrames(frames: [ChromaFrame], beats: [Double], duration: Double) -> [ChromaFrame] {
+        guard beats.count >= 2, !frames.isEmpty else { return [] }
+        var result: [ChromaFrame] = []
+        result.reserveCapacity(beats.count)
+        let fallback = beats.count > 1 ? beats[1] - beats[0] : 0.5
+        for (index, start) in beats.enumerated() {
+            let end = index + 1 < beats.count ? beats[index + 1] : min(duration, start + fallback)
+            let inside = frames.filter { $0.time >= start && $0.time < end }
+            let source = inside.isEmpty
+                ? [frames.min(by: { abs($0.time - start) < abs($1.time - start) })!]
+                : inside
+            var values = [Float](repeating: 0, count: 12)
+            var energy: Float = 0
+            for frame in source {
+                for k in 0..<12 { values[k] += frame.values[k] }
+                energy += frame.energy
+            }
+            let count = Float(source.count)
+            for k in 0..<12 { values[k] /= count }
+            let peak = values.max() ?? 0
+            if peak > 0 { for k in 0..<12 { values[k] /= peak } }
+            result.append(ChromaFrame(values: values, energy: energy / count, time: start))
+        }
+        return result
     }
 
     /// Последовательность аккордов по долям: хрома усредняется внутри доли,
@@ -236,7 +284,8 @@ enum ChordRecognizer {
         for frame in frames {
             var s = scores(for: frame.values, key: options.key,
                            vocabulary: options.vocabulary, vocabularyBoost: options.vocabularyBoost,
-                           outsidePenalty: options.outsidePenalty)
+                           outsidePenalty: options.outsidePenalty,
+                           outsideAdvantage: options.outsideAdvantage)
             s.append(options.noChordScore)
             if frame.energy < silenceThreshold {
                 for i in 0..<noneState { s[i] = 0 }
@@ -351,7 +400,8 @@ enum ChordRecognizer {
                     : Double(scores(for: frames[j].values, key: options.key,
                                         vocabulary: options.vocabulary,
                                         vocabularyBoost: options.vocabularyBoost,
-                                        outsidePenalty: options.outsidePenalty)[state])
+                                        outsidePenalty: options.outsidePenalty,
+                                        outsideAdvantage: options.outsideAdvantage)[state])
                 confidenceSum += score
                 j += 1
             }
