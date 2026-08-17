@@ -19,10 +19,6 @@ enum PhraseModel {
         var support: Double
     }
 
-    /// Ищет фразу: самое частое окно из последовательности аккордов по тактам.
-    ///
-    /// Считаются все окна подряд, а не позиции по модулю длины, — иначе одно сокращение
-    /// сбивает фазу и дальше всё считается несовпадением.
     /// Поворачивает кольцо так, чтобы фраза начиналась с заданного аккорда.
     ///
     /// Найденное окно — это кольцо: где его разрезать, поиск не знает, любой поворот для
@@ -35,33 +31,63 @@ enum PhraseModel {
         return rotated
     }
 
-    static func find(barChords: [ChordLabel], beatsPerBar: Int, maxLength: Int = 8) -> Phrase? {
-        let chords = barChords.filter { !$0.isNone }
-        guard chords.count >= 4 else { return nil }
+    /// Ищет фразу: находит период повторения и берёт то проведение, которое разобрано
+    /// увереннее остальных.
+    ///
+    /// Самое частое окно тут не годится: если каждый аккорд занимает по несколько тактов,
+    /// а часть проведений искажена, точных повторов может не оказаться вовсе. Зато период
+    /// виден по совпадениям со сдвигом, а среди одинаковых по смыслу проведений всегда есть
+    /// более чистое — его и берём за образец, вместо того чтобы усреднять с испорченными.
+    static func find(
+        barChords: [ChordLabel], barSteadiness: [Double] = [], beatsPerBar: Int, maxLength: Int = 12
+    ) -> Phrase? {
+        let count = barChords.count
+        guard count >= 4 else { return nil }
+        let steadiness = barSteadiness.count == count
+            ? barSteadiness
+            : [Double](repeating: 1, count: count)
 
-        var candidates: [Phrase] = []
-        for length in 2...min(maxLength, chords.count / 2) {
-            var counts: [[ChordLabel]: Int] = [:]
-            for start in 0...(chords.count - length) {
-                let window = Array(chords[start..<(start + length)])
-                // Фраза из одного повторяющегося аккорда ничего не объясняет.
-                guard Set(window).count > 1 else { continue }
-                counts[window, default: 0] += 1
+        // Период: сдвиг, при котором запись больше всего похожа сама на себя.
+        var bestPeriod = 0
+        var bestAgreement = 0.0
+        for period in 2...min(maxLength, count / 2) {
+            var matches = 0
+            var total = 0
+            for index in 0..<(count - period) {
+                guard !barChords[index].isNone, !barChords[index + period].isNone else { continue }
+                total += 1
+                if barChords[index] == barChords[index + period] { matches += 1 }
             }
-            guard var (window, count) = counts.max(by: { $0.value < $1.value }), count >= 2 else { continue }
-            window = shortestPeriod(of: window)
-
-            // Насколько эта фраза покрывает запись: сколько тактов попадает в её вхождения.
-            let support = Double(count * length) / Double(chords.count)
-            candidates.append(Phrase(chords: window, beatsPerChord: beatsPerBar, support: support))
+            guard total > 0 else { continue }
+            // Короткий период объясняет запись дешевле, поэтому при равном согласии
+            // предпочитаем его.
+            let agreement = Double(matches) / Double(total) - Double(period) * 1e-3
+            if agreement > bestAgreement {
+                bestAgreement = agreement
+                bestPeriod = period
+            }
         }
+        guard bestPeriod > 0, bestAgreement >= 0.5 else { return nil }
 
-        // Из фраз с почти одинаковым покрытием берём самую короткую: длинная обычно
-        // оказывается склейкой двух проведений, и выравнивание с ней теряет гибкость.
-        guard let bestSupport = candidates.map({ $0.support }).max() else { return nil }
-        return candidates
-            .filter { $0.support >= bestSupport * 0.95 }
-            .min { $0.chords.count < $1.chords.count }
+        // Проведения фразы — блоки длиной в период. Берём самый уверенно разобранный.
+        var bestStart = 0
+        var bestScore = -Double.infinity
+        var start = 0
+        while start + bestPeriod <= count {
+            let block = start..<(start + bestPeriod)
+            guard barChords[block].allSatisfy({ !$0.isNone }) else { start += 1; continue }
+            let score = steadiness[block].reduce(0, +) / Double(bestPeriod)
+                + regularity(of: Array(barChords[block]))
+            if score > bestScore {
+                bestScore = score
+                bestStart = start
+            }
+            start += 1
+        }
+        guard bestScore > -Double.infinity else { return nil }
+
+        let window = shortestPeriod(of: Array(barChords[bestStart..<(bestStart + bestPeriod)]))
+        return Phrase(chords: window, beatsPerChord: beatsPerBar, support: bestAgreement)
     }
 
     /// Ожидаемый аккорд для каждой доли — выравниванием записи с повторами фразы.
@@ -151,6 +177,30 @@ enum PhraseModel {
             penalty += observed[index].isNone ? 0.4 : 1
         }
         return penalty
+    }
+
+    /// Насколько ровно в блоке сменяются аккорды: держатся ли они одинаковое время.
+    ///
+    /// Там, где распознавание сбоит, аккорд дробится или обрывается раньше времени, и длины
+    /// расходятся. Проведение с ровным гармоническим шагом почти всегда и есть верное.
+    private static func regularity(of block: [ChordLabel]) -> Double {
+        var lengths: [Double] = []
+        var index = 0
+        while index < block.count {
+            var end = index
+            while end + 1 < block.count && block[end + 1] == block[index] { end += 1 }
+            lengths.append(Double(end - index + 1))
+            index = end + 1
+        }
+        guard lengths.count > 1 else { return 0 }
+        let mean = lengths.reduce(0, +) / Double(lengths.count)
+        guard mean > 0 else { return 0 }
+        let variance = lengths.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / Double(lengths.count)
+        return 1 / (1 + sqrt(variance) / mean)
+    }
+
+    private static func name(of window: [ChordLabel]) -> String {
+        window.map { $0.name }.joined(separator: " ")
     }
 
     /// Если найденное окно — это одна и та же фраза, повторённая дважды, работать надо

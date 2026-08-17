@@ -107,7 +107,11 @@ enum SongAnalyzer {
                 to: grid, beat: beat, duration: duration,
                 melodyShare: share, diagnostics: diagnostics
             ) {
-                grid = tightened
+                // Фраза — подсказка, а не приговор: если после подгонки разбор стал хуже,
+                // значит запись живёт не по ней, и лучше оставить как было.
+                diagnostics?(String(format: "Оценка сетки: без фразы %.3f, с фразой %.3f",
+                                    grid.score, tightened.score))
+                if tightened.score >= grid.score { grid = tightened }
             }
         }
 
@@ -216,7 +220,9 @@ enum SongAnalyzer {
 
         // Берём аккорды, покрывающие основное чистое время: редкие гости почти всегда
         // сами являются испорченной версией частого аккорда.
-        let ranked = weight.keys.sorted { weight[$0]! > weight[$1]! }
+        // Порядок обхода словаря не определён — при равных весах сортируем по индексу,
+        // чтобы словарь не менялся от запуска к запуску.
+        let ranked = weight.keys.sorted { (weight[$0]!, $1) > (weight[$1]!, $0) }
         let total = weight.values.reduce(0, +)
         var vocabulary: Set<Int> = []
         var covered = 0.0
@@ -266,7 +272,15 @@ enum SongAnalyzer {
         let barChords = grid.bars.map { bar -> ChordLabel in
             var counts: [ChordLabel: Int] = [:]
             for chord in bar.beatChords { counts[chord, default: 0] += 1 }
-            return counts.max { $0.value < $1.value }?.key ?? .none
+            // При равном числе долей берём тот аккорд, что зазвучал раньше, — иначе
+            // выбор зависел бы от порядка обхода словаря.
+            var best = ChordLabel.none
+            var bestCount = 0
+            for chord in bar.beatChords where (counts[chord] ?? 0) > bestCount {
+                best = chord
+                bestCount = counts[chord] ?? 0
+            }
+            return best
         }
 
         // Фразу ищем по тактам, где солиста почти не слышно: под голосом аккорды сами
@@ -283,13 +297,17 @@ enum SongAnalyzer {
             }
             barShare.append(count > 0 ? sum / Double(count) : 1)
         }
-        let quietLimit = barShare.sorted()[barShare.count / 2]
-        let cleanBars = zip(barChords, barShare).filter { $0.1 <= quietLimit }.map { $0.0 }
-
-        guard var phrase = PhraseModel.find(barChords: cleanBars, beatsPerBar: beat.beatsPerBar)
-                ?? PhraseModel.find(barChords: barChords, beatsPerBar: beat.beatsPerBar) else {
-            return nil
+        // Насколько уверенно разобран каждый такт: аккорд держится весь такт и его слышно
+        // без солиста. Из нескольких проведений одной фразы образцом станет самое чистое.
+        let steadiness = grid.bars.enumerated().map { index, bar -> Double in
+            let uniform = bar.beatChords.allSatisfy { $0 == bar.beatChords.first } ? 1.0 : 0.0
+            let quiet = 1 - min(1, barShare[index])
+            return uniform * 0.7 + quiet * 0.3
         }
+
+        guard var phrase = PhraseModel.find(
+            barChords: barChords, barSteadiness: steadiness, beatsPerBar: beat.beatsPerBar
+        ) else { return nil }
         // Читаем фразу с того аккорда, с которого её играет запись, а не с произвольного
         // места кольца.
         if let opening = barChords.first(where: { !$0.isNone }) {
@@ -311,7 +329,6 @@ enum SongAnalyzer {
         }
 
         let vocabulary = Set(phrase.chords)
-        let noisyLimit = melodyShare.sorted()[melodyShare.count / 2]
         var corrected = labels
         var changes = 0
         for (offset, expectedChord) in expected.enumerated() {
@@ -320,13 +337,12 @@ enum SongAnalyzer {
             // Правим там, где хроме верить нельзя: доля пустая, аккорд вообще не из фразы,
             // либо поверх играет голос. Где солиста нет, а хрома уверенно говорит своё,
             // фразу не навязываем — иначе потеряются настоящие отклонения от неё.
-            // Под голосом верим фразе только там, где аккорд явно «залип»: тянется с
-            // предыдущей доли, хотя фраза давно ушла дальше. Просто громкий голос — ещё
-            // не повод переписывать уверенно распознанный аккорд.
-            let isNoisy = index < melodyShare.count && melodyShare[index] > noisyLimit
+            // Верим фразе там, где запись сама себе противоречит: доля пустая, аккорд не из
+            // фразы, либо он «залип» — тянется с прошлой доли, хотя фраза давно ушла дальше.
+            // Уверенно распознанный аккорд, который просто отличается от фразы, не трогаем:
+            // отклонения от неё бывают настоящими.
             let isStuck = index > 0 && corrected[index] == corrected[index - 1]
-            guard corrected[index].isNone || !vocabulary.contains(corrected[index])
-                    || (isNoisy && isStuck) else {
+            guard corrected[index].isNone || !vocabulary.contains(corrected[index]) || isStuck else {
                 continue
             }
             corrected[index] = expectedChord
@@ -334,6 +350,7 @@ enum SongAnalyzer {
         }
         diagnostics?("Фраза поправила долей: \(changes)")
         guard changes > 0 else { return nil }
+        removeSpecks(&corrected, from: start, minimumBeats: max(2, beat.beatsPerBar / 2))
 
         let bars = buildBars(
             beats: grid.beats, beatsPerBar: beat.beatsPerBar,
@@ -344,6 +361,36 @@ enum SongAnalyzer {
             beats: grid.beats, chords: chords, bars: bars, startBeat: start,
             score: gridScore(bars: bars, beats: grid.beats)
         )
+    }
+
+    /// Убирает вкрапления: аккорд, продержавшийся меньше положенного и не подхваченный
+    /// соседями, — это не смена гармонии, а дрожание распознавателя. Такой кусок отдаём
+    /// тому соседу, который длиннее.
+    static func removeSpecks(_ labels: inout [ChordLabel], from start: Int, minimumBeats: Int) {
+        guard minimumBeats > 1, start < labels.count else { return }
+        var index = start
+        while index < labels.count {
+            var end = index
+            while end + 1 < labels.count && labels[end + 1] == labels[index] { end += 1 }
+            let length = end - index + 1
+
+            if length < minimumBeats {
+                let before = index > start ? labels[index - 1] : ChordLabel.none
+                let after = end + 1 < labels.count ? labels[end + 1] : ChordLabel.none
+                var beforeLength = 0
+                var cursor = index - 1
+                while cursor >= start && labels[cursor] == before { beforeLength += 1; cursor -= 1 }
+                var afterLength = 0
+                cursor = end + 1
+                while cursor < labels.count && labels[cursor] == after { afterLength += 1; cursor += 1 }
+
+                let winner = beforeLength >= afterLength ? before : after
+                if !winner.isNone {
+                    for position in index...end { labels[position] = winner }
+                }
+            }
+            index = end + 1
+        }
     }
 
     // MARK: - Выбор сетки
