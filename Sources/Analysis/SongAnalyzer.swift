@@ -66,6 +66,9 @@ enum SongAnalyzer {
         var grid = bestGrid(
             beat: beat, chroma: chroma, duration: duration, options: beatOptions
         )
+        // Аккорды, на которых песня действительно держится, — нужны и второму проходу,
+        // и подгонке под фразу.
+        var known: Set<ChordLabel> = []
 
         // Второй проход по образцам из чистых мест. Там, где поёт голос, хрома засорена
         // нотами мелодии и аккорд «уплывает» на соседний. Но тот же аккорд почти наверняка
@@ -75,6 +78,7 @@ enum SongAnalyzer {
                 beats: grid.beats, melody: melody, accompaniment: harmony, sampleRate: sampleRate
             )
             let model = cleanModel(grid: grid, melodyShare: share)
+            known = Set(model.vocabulary.map { ChordRecognizer.templates[$0].label })
             let names = model.vocabulary.map { ChordRecognizer.templates[$0].label.name }.sorted()
             diagnostics?("Словарь чистых мест: \(names.count) — \(names.joined(separator: ", "))")
             for (from, targets) in model.transitions.sorted(by: { $0.key < $1.key }) {
@@ -111,7 +115,7 @@ enum SongAnalyzer {
             )
             if let tightened = applyPhrase(
                 to: grid, beat: beat, chroma: chroma, duration: duration,
-                melodyShare: share, diagnostics: diagnostics
+                melodyShare: share, known: known, diagnostics: diagnostics
             ) {
                 // Фраза — подсказка, а не приговор: если после подгонки разбор стал хуже,
                 // значит запись живёт не по ней, и лучше оставить как было.
@@ -272,7 +276,7 @@ enum SongAnalyzer {
     /// потеряются настоящие отклонения от неё.
     static func applyPhrase(
         to grid: Grid, beat: BeatResult, chroma: [ChromaFrame], duration: Double,
-        melodyShare: [Double], diagnostics: ((String) -> Void)?
+        melodyShare: [Double], known: Set<ChordLabel>, diagnostics: ((String) -> Void)?
     ) -> Grid? {
         guard !grid.bars.isEmpty, !melodyShare.isEmpty else { return nil }
 
@@ -326,7 +330,7 @@ enum SongAnalyzer {
         for phrase in phrases {
             guard let candidate = fit(
                 phrase: phrase, to: grid, beat: beat, chroma: chroma, duration: duration,
-                melodyShare: melodyShare, diagnostics: diagnostics
+                melodyShare: melodyShare, known: known, diagnostics: diagnostics
             ) else { continue }
             if best == nil || candidate.score > best!.score {
                 best = candidate
@@ -343,7 +347,8 @@ enum SongAnalyzer {
     /// Подгоняет запись под одну конкретную фразу.
     private static func fit(
         phrase: PhraseModel.Phrase, to grid: Grid, beat: BeatResult, chroma: [ChromaFrame],
-        duration: Double, melodyShare: [Double], diagnostics: ((String) -> Void)? = nil
+        duration: Double, melodyShare: [Double], known: Set<ChordLabel>,
+        diagnostics: ((String) -> Void)? = nil
     ) -> Grid? {
         let labels = beatChords(beats: grid.beats, chords: grid.chords, duration: duration)
         let start = grid.startBeat
@@ -376,6 +381,10 @@ enum SongAnalyzer {
             let observed = Array(corrected[from...to])
             let target = expected[from - start]
             guard observed.contains(where: { $0 != target }) else { continue }
+            // Внутри участка может стоять настоящая смена — укороченное проведение, где
+            // один аккорд уступает место следующему на половине. Заменив такой участок
+            // одним аккордом, мы бы стёрли то, что запись слышит отчётливо.
+            guard !holdsRealChange(observed, within: known.union(phrase.chords)) else { continue }
 
             var candidate = corrected
             for index in from...to { candidate[index] = target }
@@ -405,6 +414,22 @@ enum SongAnalyzer {
             beats: grid.beats, chords: chords, bars: bars, startBeat: start,
             score: gridScore(bars: bars, beats: grid.beats)
         )
+    }
+
+    /// Есть ли внутри участка смена, которую стоит уважать: ровно один перелом,
+    /// и обе части достаточно длинные, чтобы быть аккордом, а не дрожанием.
+    private static func holdsRealChange(_ observed: [ChordLabel], within known: Set<ChordLabel>) -> Bool {
+        guard observed.count >= 4 else { return false }
+        var changes: [Int] = []
+        for index in 1..<observed.count where observed[index] != observed[index - 1] {
+            changes.append(index)
+        }
+        guard changes.count == 1, let split = changes.first else { return false }
+        let half = observed.count / 2
+        guard split >= half, observed.count - split >= half else { return false }
+        // Обе стороны смены должны быть аккордами этой песни: уход в аккорд, которого
+        // в записи больше нигде нет, — обычно ошибка распознавания, а не сокращение.
+        return known.contains(observed[0]) && known.contains(observed[split])
     }
 
     /// Границы участков, где фраза ожидает один и тот же аккорд.
