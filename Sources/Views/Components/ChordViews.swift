@@ -40,35 +40,95 @@ struct ChordChip: View {
     }
 }
 
-/// Сетка тактов: аккорды и номер такта в углу.
+/// Сетка тактов, разложенная по проведениям фразы.
+///
+/// Ровные ряды по четыре ломаются на первом же укороченном проведении: дальше одинаковые
+/// места фразы перестают стоять друг под другом, и разметку становится невозможно читать
+/// глазами. Поэтому строка здесь — это проведение фразы, даже если тактов в нём меньше.
 struct BarsGridView: View {
     let bars: [Bar]
     let currentTime: Double
+    /// Такты, с которых начинается новое проведение. Пусто — раскладываем поровну.
+    var phraseStarts: [Int] = []
 
-    // Четыре такта в ряд: подпись «Такт» не нужна, а номер уходит в угол,
-    // поэтому ячейке хватает ширины одного-двух тэгов.
-    private let columns = Array(repeating: GridItem(.flexible(), spacing: 6), count: 4)
+    private let maximumPerRow = 4
 
     var body: some View {
-        LazyVGrid(columns: columns, spacing: 8) {
-            ForEach(bars) { bar in
-                let isActive = currentTime >= bar.start && currentTime < bar.end
-                VStack(alignment: .trailing, spacing: 2) {
-                    // Номер нужен для сверки с разбором, поэтому он мелкий и не спорит
-                    // с аккордом за внимание.
-                    Text("\(bar.index + 1)")
-                        .font(.system(size: 10, weight: .medium, design: .rounded))
-                        .foregroundStyle(Theme.textSecondary.opacity(isActive ? 1 : 0.6))
-                        .padding(.trailing, 4)
-
-                    VStack(spacing: 3) {
-                        ForEach(Array(bar.uniqueChords.enumerated()), id: \.offset) { _, chord in
-                            ChordChip(label: chord, isActive: isActive, size: 13, fillsWidth: true)
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                HStack(spacing: 6) {
+                    ForEach(row) { bar in
+                        cell(for: bar)
+                    }
+                    // Короткое проведение не растягиваем: такты должны сохранять ширину,
+                    // иначе столбцы разъедутся и сравнивать строки будет не с чем.
+                    if row.count < maximumPerRow {
+                        ForEach(0..<(maximumPerRow - row.count), id: \.self) { _ in
+                            Color.clear.frame(maxWidth: .infinity)
                         }
                     }
                 }
-                .id(bar.id)
             }
         }
+    }
+
+    /// Аккорд, звучащий в такте в текущий момент.
+    private func soundingChord(in bar: Bar) -> ChordLabel? {
+        let count = bar.beatChords.count
+        guard count > 0, bar.end > bar.start else { return bar.uniqueChords.first }
+        let position = (currentTime - bar.start) / (bar.end - bar.start)
+        let index = min(count - 1, max(0, Int(position * Double(count))))
+        return bar.beatChords[index]
+    }
+
+    private var rows: [[Bar]] {
+        let starts = phraseStarts.isEmpty
+            ? Array_stride(from: 0, to: bars.count, by: maximumPerRow)
+            : phraseStarts
+        var result: [[Bar]] = []
+        for (index, start) in starts.enumerated() {
+            let end = index + 1 < starts.count ? starts[index + 1] : bars.count
+            guard start < end, start < bars.count else { continue }
+            // Длинное проведение всё равно приходится делить: в строку помещается
+            // ограниченное число тактов.
+            var position = start
+            while position < min(end, bars.count) {
+                let stop = min(position + maximumPerRow, end, bars.count)
+                result.append(Array(bars[position..<stop]))
+                position = stop
+            }
+        }
+        return result
+    }
+
+    private func Array_stride(from: Int, to: Int, by: Int) -> [Int] {
+        var result: [Int] = []
+        var value = from
+        while value < to {
+            result.append(value)
+            value += by
+        }
+        return result
+    }
+
+    private func cell(for bar: Bar) -> some View {
+        let isActive = currentTime >= bar.start && currentTime < bar.end
+        // Внутри такта аккорды сменяют друг друга, поэтому подсвечивается не весь такт
+        // целиком, а тот аккорд, который звучит прямо сейчас.
+        let sounding = isActive ? soundingChord(in: bar) : nil
+        return VStack(alignment: .trailing, spacing: 2) {
+            Text("\(bar.index + 1)")
+                .font(.system(size: 10, weight: .medium, design: .rounded))
+                .foregroundStyle(Theme.textSecondary.opacity(isActive ? 1 : 0.6))
+                .padding(.trailing, 4)
+
+            VStack(spacing: 3) {
+                ForEach(Array(bar.uniqueChords.enumerated()), id: \.offset) { _, chord in
+                    ChordChip(label: chord, isActive: chord == sounding, size: 13, fillsWidth: true)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .id(bar.id)
     }
 }

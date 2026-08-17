@@ -139,7 +139,8 @@ enum SongAnalyzer {
             key: (KeyEstimator.estimate(fromChords: finalChords) ?? key)?.name,
             chords: finalChords,
             bars: grid.bars,
-            tempoConfidence: beat.confidence
+            tempoConfidence: beat.confidence,
+            phraseStarts: grid.phraseStarts
         )
     }
 
@@ -354,9 +355,10 @@ enum SongAnalyzer {
         let start = grid.startBeat
         guard start < labels.count else { return nil }
         let tail = Array(labels[start...])
-        guard let expected = PhraseModel.expectedChords(phrase: phrase, beatChords: tail) else {
+        guard let alignment = PhraseModel.expectedChords(phrase: phrase, beatChords: tail) else {
             return nil
         }
+        let expected = alignment.chords
 
         // Правки применяем по одному месту, а не всей записью разом.
         //
@@ -403,7 +405,18 @@ enum SongAnalyzer {
             accepted += 1
         }
         diagnostics?("Фраза поправила мест: \(accepted)")
-        guard accepted > 0 else { return nil }
+
+        // Даже если править нечего, выравнивание уже сказало главное: где кончается одно
+        // проведение фразы и начинается следующее. Эта разбивка нужна разметке, чтобы
+        // одинаковые места фразы стояли друг под другом.
+        let starts = runStarts(
+            elements: alignment.elements, bars: grid.bars, beats: grid.beats, offset: start
+        )
+        guard accepted > 0 else {
+            var unchanged = grid
+            unchanged.phraseStarts = starts
+            return unchanged
+        }
 
         let bars = buildBars(
             beats: grid.beats, beatsPerBar: beat.beatsPerBar,
@@ -412,6 +425,9 @@ enum SongAnalyzer {
         let chords = segments(from: bars, source: grid.chords)
         return Grid(
             beats: grid.beats, chords: chords, bars: bars, startBeat: start,
+            phraseStarts: runStarts(
+                elements: alignment.elements, bars: bars, beats: grid.beats, offset: start
+            ),
             score: gridScore(bars: bars, beats: grid.beats)
         )
     }
@@ -441,6 +457,21 @@ enum SongAnalyzer {
             while end + 1 < expected.count && expected[end + 1] == expected[index] { end += 1 }
             if !expected[index].isNone { result.append((offset + index, offset + end)) }
             index = end + 1
+        }
+        return result
+    }
+
+    /// Переводит номера элементов фразы (они считаны по долям) в номера тактов,
+    /// с которых начинается очередное проведение.
+    private static func runStarts(
+        elements: [Int], bars: [Bar], beats: [Double], offset: Int
+    ) -> [Int] {
+        var result: [Int] = []
+        for (index, bar) in bars.enumerated() {
+            guard let beatIndex = beats.firstIndex(where: { $0 >= bar.start - 1e-6 }) else { continue }
+            let position = beatIndex - offset
+            guard position >= 0, position < elements.count else { continue }
+            if elements[position] == 0 { result.append(index) }
         }
         return result
     }
@@ -528,6 +559,8 @@ enum SongAnalyzer {
         var chords: [ChordSegment]
         var bars: [Bar]
         var startBeat: Int
+        /// Такты, с которых начинается новое проведение фразы.
+        var phraseStarts: [Int] = []
         /// Насколько хорошо такты объясняют гармонию: доля тактов под одним аккордом.
         var score: Double
     }

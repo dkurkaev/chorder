@@ -148,9 +148,11 @@ enum PhraseModel {
     /// Динамическое программирование по долям: каждый элемент фразы занимает либо свою
     /// полную длину, либо половину. Возвращает `nil`, если фраза объясняет запись плохо —
     /// значит гармония здесь не циклическая и подгонять нечего.
+    /// Ожидаемые аккорды и номер элемента фразы для каждой доли. По номеру видно, где
+    /// начинается очередное проведение, — это и есть строка в разметке.
     static func expectedChords(
         phrase: Phrase, beatChords: [ChordLabel], minAgreement: Double = 0.55
-    ) -> [ChordLabel]? {
+    ) -> (chords: [ChordLabel], elements: [Int])? {
         let count = beatChords.count
         let elements = phrase.chords.count
         guard count > phrase.beatsPerChord * 2, elements > 1 else { return nil }
@@ -206,12 +208,16 @@ enum PhraseModel {
         guard bestCost < infinity else { return nil }
 
         var expected = [ChordLabel](repeating: .none, count: count)
+        var elementAt = [Int](repeating: -1, count: count)
         var t = bestEnd
         var j = bestElement
         while t > 0 {
             let step = back[t][j]
             let length = step?.length ?? t
-            for position in max(0, t - length)..<t { expected[position] = phrase.chords[j] }
+            for position in max(0, t - length)..<t {
+                expected[position] = phrase.chords[j]
+                elementAt[position] = j
+            }
             guard let step else { break }
             t = step.t
             j = step.j
@@ -220,7 +226,7 @@ enum PhraseModel {
         // Если выравнивание согласно с записью меньше чем наполовину — фраза не та.
         let agreement = zip(expected, beatChords).filter { $0 == $1 }.count
         guard Double(agreement) / Double(count) >= minAgreement else { return nil }
-        return expected
+        return (expected, elementAt)
     }
 
     private static func mismatch(

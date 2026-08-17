@@ -152,6 +152,7 @@ for segment in result.chords {
                  segment.start, segment.end, segment.label.name as NSString, segment.confidence))
 }
 print("Прогрессия: \(result.progressionSummary)")
+print("Начала проведений (такты): " + result.phraseStarts.map { String($0 + 1) }.joined(separator: ", "))
 
 // Как темп ведёт себя по ходу записи: если он плывёт, средний BPM врёт везде.
 if result.beats.count > 4 {

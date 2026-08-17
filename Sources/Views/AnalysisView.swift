@@ -45,12 +45,6 @@ struct AnalysisView: View {
             // Не вся последовательность, а набор аккордов записи: по нему сразу видно,
             // на чём она держится, и он не растёт на пол-экрана вместе с длиной фрагмента.
             if !usedChords.isEmpty { chordLegend }
-            if result.tempoConfidence < 0.4 {
-                Label("Ритм определён неуверенно — попробуй записать фрагмент подлиннее или погромче",
-                      systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(Theme.accentWarm)
-            }
         }
         .cardStyle()
     }
@@ -74,9 +68,11 @@ struct AnalysisView: View {
             Button {
                 player.toggle()
             } label: {
+                // Плеер намеренно монохромный: цвет на экране принадлежит аккордам,
+                // и управление не должно с ними спорить.
                 Image(systemName: player.isPlaying ? "pause.circle.fill" : "play.circle.fill")
                     .font(.system(size: 44))
-                    .foregroundStyle(Theme.accent)
+                    .foregroundStyle(Color.primary)
             }
             .buttonStyle(.plain)
 
@@ -108,7 +104,7 @@ struct AnalysisView: View {
                 : 0
             ZStack(alignment: .leading) {
                 Capsule().fill(Theme.surfaceHigh)
-                Capsule().fill(Theme.accent)
+                Capsule().fill(Color.primary)
                     .frame(width: geometry.size.width * fraction)
             }
             .contentShape(Rectangle())
@@ -182,7 +178,11 @@ struct AnalysisView: View {
             // увидеть текущий такт, приходится листать страницу и терять кнопку паузы.
             ScrollViewReader { proxy in
                 ScrollView {
-                    BarsGridView(bars: result.bars, currentTime: player.currentTime)
+                    BarsGridView(
+                        bars: result.bars,
+                        currentTime: player.currentTime,
+                        phraseStarts: result.phraseStarts
+                    )
                         .padding(.vertical, 2)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
