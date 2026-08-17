@@ -180,15 +180,21 @@ enum PhraseModel {
 
         for t in 1...count {
             for j in 0..<elements where cost[t][j] < infinity {
-                let next = (j + 1) % elements
-                for length in lengths where t + length <= count {
-                    let candidate = cost[t][j]
-                        + mismatch(beatChords, from: t, count: length, chord: phrase.chords[next])
-                        + shrinkPenalty(length: length, full: full)
+                // Шаг вперёд на один элемент — обычный ход; на два — проведение, в котором
+                // аккорд пропущен совсем. Без такого хода одно сокращение сбивает фазу,
+                // и дальше фраза едет мимо записи до самого конца.
+                for step in 1...min(2, elements - 1) {
+                    let next = (j + step) % elements
+                    for length in lengths where t + length <= count {
+                        let candidate = cost[t][j]
+                            + mismatch(beatChords, from: t, count: length, chord: phrase.chords[next])
+                            + shrinkPenalty(length: length, full: full)
+                            + (step > 1 ? skipCost : 0)
 
-                    if candidate < cost[t + length][next] {
-                        cost[t + length][next] = candidate
-                        back[t + length][next] = (t: t, j: j, length: length)
+                        if candidate < cost[t + length][next] {
+                            cost[t + length][next] = candidate
+                            back[t + length][next] = (t: t, j: j, length: length)
+                        }
                     }
                 }
             }
@@ -206,6 +212,7 @@ enum PhraseModel {
             }
         }
         guard bestCost < infinity else { return nil }
+        let uncovered = count - bestEnd
 
         var expected = [ChordLabel](repeating: .none, count: count)
         var elementAt = [Int](repeating: -1, count: count)
@@ -221,6 +228,22 @@ enum PhraseModel {
             guard let step else { break }
             t = step.t
             j = step.j
+        }
+
+        // Хвост, не покрытый выравниванием, достраиваем продолжением фразы: последние такты
+        // записи часто звучат тише и распознаются хуже, но фраза-то продолжается.
+        if uncovered > 0 {
+            var element = (bestElement + 1) % elements
+            var position = bestEnd
+            while position < count {
+                let length = min(full, count - position)
+                for offset in position..<(position + length) {
+                    expected[offset] = phrase.chords[element]
+                    elementAt[offset] = element
+                }
+                position += length
+                element = (element + 1) % elements
+            }
         }
 
         // Если выравнивание согласно с записью меньше чем наполовину — фраза не та.
@@ -283,6 +306,8 @@ enum PhraseModel {
     /// Сжатие — приём законный, но редкий: без штрафа выравнивание начнёт кромсать фразу
     /// везде, где запись хоть немного не совпала.
     static var shrinkCost = 0.75
+    /// Пропуск элемента — приём более редкий, чем сжатие, поэтому и стоит дороже.
+    static var skipCost = 1.5
 
     private static func shrinkPenalty(length: Int, full: Int) -> Double {
         length == full ? 0 : shrinkCost

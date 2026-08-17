@@ -100,6 +100,7 @@ if let r = env["TRANS_RELIEF"].flatMap(Float.init) { SongAnalyzer.transitionReli
 if let a = env["VOCAB_ADV"].flatMap(Float.init) { SongAnalyzer.outsideAdvantage = a }
 if let b = env["VOCAB_BOOST"].flatMap(Float.init) { SongAnalyzer.vocabularyBoost = b }
 if let c = env["SHRINK"].flatMap(Double.init) { PhraseModel.shrinkCost = c }
+if let k = env["SKIP"].flatMap(Double.init) { PhraseModel.skipCost = k }
 if let u = env["TRANS_UNKNOWN"].flatMap(Float.init) { SongAnalyzer.unknownTransitionFactor = u }
 
 if ProcessInfo.processInfo.environment["TRACKS"] == "1" {

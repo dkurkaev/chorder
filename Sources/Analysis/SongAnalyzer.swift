@@ -123,6 +123,13 @@ enum SongAnalyzer {
                                     grid.score, tightened.score))
                 if tightened.score >= grid.score { grid = tightened }
             }
+
+            // Финальный проход по структуре: достраиваем то, что выпало из проведений.
+            if let phrase = grid.phrase, let restored = restoreMissingElements(
+                in: grid, phrase: phrase, beat: beat, duration: duration, diagnostics: diagnostics
+            ) {
+                grid = restored
+            }
         }
 
         // Тональность считаем по итоговым аккордам, а не по сырой хроме.
@@ -376,6 +383,16 @@ enum SongAnalyzer {
         )
 
         let runs = phraseRuns(expected: expected, offset: start)
+        // Диагностика: что фраза ожидает в каждом такте против того, что слышно.
+        diagnostics?("Ожидание по тактам: " + grid.bars.enumerated().compactMap { index, bar -> String? in
+            guard let beatIndex = grid.beats.firstIndex(where: { $0 >= bar.start - 1e-6 }) else { return nil }
+            let position = beatIndex - start
+            guard position >= 0, position + beat.beatsPerBar <= expected.count else { return nil }
+            let slice = expected[position..<(position + beat.beatsPerBar)]
+            let names = slice.map { $0.isNone ? "·" : $0.name }
+            let compact = names.reduce(into: [String]()) { if $0.last != $1 { $0.append($1) } }
+            return "\(index + 1):\(compact.joined(separator: "+"))"
+        }.joined(separator: " "))
         diagnostics?("Фраза ожидает: " + runs.prefix(12).map { from, to in
             "\(from)-\(to):\(expected[from - start].name)"
         }.joined(separator: " "))
@@ -415,6 +432,7 @@ enum SongAnalyzer {
         guard accepted > 0 else {
             var unchanged = grid
             unchanged.phraseStarts = starts
+            unchanged.phrase = phrase
             return unchanged
         }
 
@@ -428,6 +446,7 @@ enum SongAnalyzer {
             phraseStarts: runStarts(
                 elements: alignment.elements, bars: bars, beats: grid.beats, offset: start
             ),
+            phrase: phrase,
             score: gridScore(bars: bars, beats: grid.beats)
         )
     }
@@ -552,6 +571,99 @@ enum SongAnalyzer {
         }
     }
 
+    // MARK: - Восстановление пропущенных элементов фразы
+
+    /// Последний проход: достраивает то, что выпало из проведения.
+    ///
+    /// К этому месту известно и какую фразу играет песня, и где начинается каждое её
+    /// проведение. Если в одном проведении элемент фразы отсутствует, а соседние
+    /// проведения его исправно содержат — это потеря распознавания, а не замысел
+    /// исполнителя. Такой элемент возвращается на место: он забирает первую половину
+    /// такта у аккорда, который встал на его позицию.
+    ///
+    /// Проход работает от структуры, а не от звука: акустика в таких местах уже показала,
+    /// что ей верить нельзя, поэтому оценка сетки здесь не спрашивается.
+    static func restoreMissingElements(
+        in grid: Grid, phrase: PhraseModel.Phrase, beat: BeatResult,
+        duration: Double, diagnostics: ((String) -> Void)?
+    ) -> Grid? {
+        let starts = grid.phraseStarts
+        guard starts.count >= 2, phrase.chords.count >= 3 else { return nil }
+
+        var labels = beatChords(beats: grid.beats, chords: grid.chords, duration: duration)
+        var restored = 0
+
+        for (index, runStart) in starts.enumerated() {
+            let runEnd = index + 1 < starts.count ? starts[index + 1] : grid.bars.count
+            guard runStart < runEnd, runEnd <= grid.bars.count else { continue }
+            let run = Array(grid.bars[runStart..<runEnd])
+            // Проведение целиком отличается от фразы — это не потеря, а другая часть песни.
+            guard run.count == phrase.chords.count - 1 else { continue }
+
+            let observed = run.map { bar -> ChordLabel in
+                bar.beatChords.first ?? .none
+            }
+            guard let missing = missingElement(of: phrase.chords, in: observed) else { continue }
+
+            let position = missing.position
+            let half = max(1, beat.beatsPerBar / 2)
+
+            if position < run.count {
+                // Пропущенный элемент забирает первую половину такта у того, кто занял
+                // его место в проведении.
+                let bar = run[position]
+                guard observed[position] == phrase.chords[missing.index + 1],
+                      let firstBeat = grid.beats.firstIndex(where: { $0 >= bar.start - 1e-6 }),
+                      firstBeat + half <= labels.count else { continue }
+                for offset in firstBeat..<(firstBeat + half) {
+                    labels[offset] = phrase.chords[missing.index]
+                }
+            } else {
+                // Выпал последний элемент проведения — он звучал во второй половине
+                // последнего такта, которую целиком занял предыдущий аккорд.
+                guard let bar = run.last,
+                      let firstBeat = grid.beats.firstIndex(where: { $0 >= bar.start - 1e-6 }),
+                      firstBeat + beat.beatsPerBar <= labels.count else { continue }
+                for offset in (firstBeat + half)..<(firstBeat + beat.beatsPerBar) {
+                    labels[offset] = phrase.chords[missing.index]
+                }
+            }
+            restored += 1
+        }
+
+        guard restored > 0 else { return nil }
+        diagnostics?("Достроено пропущенных аккордов: \(restored)")
+
+        let bars = buildBars(
+            beats: grid.beats, beatsPerBar: beat.beatsPerBar,
+            startBeat: grid.startBeat, beatChords: labels, duration: duration
+        )
+        var result = grid
+        result.bars = bars
+        result.chords = segments(from: bars, source: grid.chords)
+        result.score = gridScore(bars: bars, beats: grid.beats)
+        return result
+    }
+
+    /// Какой элемент фразы выпал из проведения. Возвращает его номер во фразе и место,
+    /// на котором он должен был стоять. Если пропусков больше одного — не наш случай.
+    private static func missingElement(
+        of phrase: [ChordLabel], in observed: [ChordLabel]
+    ) -> (index: Int, position: Int)? {
+        var skipped: (index: Int, position: Int)?
+        var position = 0
+        for (index, expected) in phrase.enumerated() {
+            if position < observed.count, observed[position] == expected {
+                position += 1
+                continue
+            }
+            guard skipped == nil else { return nil }      // два пропуска — это уже не фраза
+            skipped = (index, position)
+        }
+        guard position == observed.count else { return nil }
+        return skipped
+    }
+
     // MARK: - Выбор сетки
 
     struct Grid {
@@ -561,6 +673,8 @@ enum SongAnalyzer {
         var startBeat: Int
         /// Такты, с которых начинается новое проведение фразы.
         var phraseStarts: [Int] = []
+        /// Фраза, по которой разложена запись.
+        var phrase: PhraseModel.Phrase?
         /// Насколько хорошо такты объясняют гармонию: доля тактов под одним аккордом.
         var score: Double
     }
