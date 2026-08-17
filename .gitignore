@@ -1,0 +1,51 @@
+# Проект генерируется из project.yml через `xcodegen generate`
+Chorder.xcodeproj/
+*.xcworkspace/
+!*.xcodeproj/project.xcworkspace/xcshareddata/
+
+# Сборка
+build/
+DerivedData/
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Xcode пользовательские настройки
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+*.moved-aside
+*.hmap
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Packages/
+Package.resolved
+
+# CocoaPods / Carthage (на случай, если появятся зависимости)
+Pods/
+Carthage/Build/
+
+# Playground / профилирование
+timeline.xctimeline
+playground.xcworkspace
+*.trace
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Локальные настройки инструментов
+.claude/settings.local.json
+
+# Временные аудиофайлы, вытащенные из симулятора для отладки
+*.caf
+*.wav
+*.m4a
+
+# Info.plist генерируется xcodegen из project.yml
+Sources/Info.plist
