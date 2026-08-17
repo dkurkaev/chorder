@@ -19,6 +19,58 @@ enum KeyEstimator {
         }
     }
 
+    /// Тональность по набору аккордов записи.
+    ///
+    /// Усреднённая хрома легко ошибается: она смешивает все ноты подряд, включая
+    /// мелодию, и выдаёт тональность, которой в аккордах нет вовсе. Аккорды — куда более
+    /// прямое свидетельство: тональность та, в чью диатонику укладывается больше всего
+    /// звучащего времени. Относительные мажор и минор (например C и Am) неразличимы по
+    /// набору аккордов вообще, поэтому спор между ними решает первый аккорд записи —
+    /// с тоники песни обычно и начинаются.
+    static func estimate(fromChords chords: [ChordSegment]) -> Key? {
+        var weight: [ChordLabel: Double] = [:]
+        for segment in chords where !segment.label.isNone {
+            weight[segment.label, default: 0] += segment.duration
+        }
+        guard !weight.isEmpty else { return nil }
+        let total = weight.values.reduce(0, +)
+        guard total > 0 else { return nil }
+
+        var scored: [(key: Key, score: Double)] = []
+        for tonic in 0..<12 {
+            for isMinor in [false, true] {
+                var fits = 0.0
+                for (label, time) in weight where isDiatonic(label, tonic: tonic, isMinor: isMinor) {
+                    fits += time
+                }
+                // Тоника, которая сама звучит, — дополнительный довод.
+                let tonicChord = weight.first { $0.key.root == tonic && ($0.key.isMinorQuality == isMinor) }
+                let bonus = (tonicChord?.value ?? 0) * 0.3
+                scored.append((Key(tonic: tonic, isMinor: isMinor, correlation: (fits + bonus) / total),
+                               fits + bonus))
+            }
+        }
+
+        guard let peak = scored.map({ $0.score }).max(), peak > 0 else { return nil }
+        let leaders = scored.filter { $0.score >= peak * 0.98 }
+        if leaders.count == 1 { return leaders[0].key }
+
+        // Спор равных решает первый аккорд записи.
+        if let opening = chords.first(where: { !$0.label.isNone })?.label,
+           let root = opening.root,
+           let match = leaders.first(where: { $0.key.tonic == root && $0.key.isMinor == opening.isMinorQuality }) {
+            return match.key
+        }
+        return leaders.max { $0.score < $1.score }?.key
+    }
+
+    private static func isDiatonic(_ label: ChordLabel, tonic: Int, isMinor: Bool) -> Bool {
+        guard let root = label.root, let quality = label.quality else { return false }
+        // Натуральный минор плюс повышенная VII ступень — иначе доминанта выпадает из лада.
+        let scale: Set<Int> = isMinor ? [0, 2, 3, 5, 7, 8, 10, 11] : [0, 2, 4, 5, 7, 9, 11]
+        return quality.intervals.allSatisfy { scale.contains((((root + $0 - tonic) % 12) + 12) % 12) }
+    }
+
     static func estimate(from frames: [ChromaFrame]) -> Key? {
         guard !frames.isEmpty else { return nil }
         var average = [Double](repeating: 0, count: 12)

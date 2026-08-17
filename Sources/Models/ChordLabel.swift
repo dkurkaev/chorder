@@ -53,6 +53,12 @@ struct ChordLabel: Codable, Hashable {
 
     var isNone: Bool { root == nil || quality == nil }
 
+    /// Минорная ли окраска — нужно для выбора между относительными тональностями.
+    var isMinorQuality: Bool {
+        guard let quality else { return false }
+        return quality.intervals.contains(3)
+    }
+
     var name: String {
         guard let root, let quality else { return "—" }
         return ChordLabel.pitchNames[((root % 12) + 12) % 12] + quality.suffix

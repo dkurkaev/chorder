@@ -56,52 +56,8 @@ struct BarsGridView: View {
                     RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .stroke(Theme.accent.opacity(isActive ? 0.8 : 0), lineWidth: 1.5)
                 )
+                .id(bar.id)
             }
         }
-    }
-}
-
-/// Горизонтальная лента аккордов по времени.
-struct ChordTimelineView: View {
-    let segments: [ChordSegment]
-    let duration: Double
-    let currentTime: Double
-    var onSeek: ((Double) -> Void)?
-
-    var body: some View {
-        GeometryReader { geometry in
-            let width = geometry.size.width
-            ZStack(alignment: .leading) {
-                HStack(spacing: 2) {
-                    ForEach(segments) { segment in
-                        let fraction = duration > 0 ? segment.duration / duration : 0
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(Theme.color(for: segment.label))
-                            .frame(width: max(2, width * fraction - 2))
-                            .overlay(
-                                Text(segment.label.isNone ? "" : segment.label.name)
-                                    .font(.system(size: 11, weight: .bold, design: .rounded))
-                                    .foregroundStyle(.black.opacity(0.8))
-                                    .lineLimit(1)
-                                    .padding(.horizontal, 2)
-                            )
-                    }
-                }
-                if duration > 0 {
-                    Rectangle()
-                        .fill(Color.white)
-                        .frame(width: 2)
-                        .offset(x: width * min(1, max(0, currentTime / duration)))
-                }
-            }
-            .contentShape(Rectangle())
-            .gesture(
-                DragGesture(minimumDistance: 0).onEnded { value in
-                    guard duration > 0, width > 0 else { return }
-                    onSeek?(Double(value.location.x / width) * duration)
-                }
-            )
-        }
-        .frame(height: 44)
     }
 }

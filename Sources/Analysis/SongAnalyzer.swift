@@ -121,6 +121,7 @@ enum SongAnalyzer {
             }
         }
 
+        // Тональность считаем по итоговым аккордам, а не по сырой хроме.
         // Лента и строка прогрессии должны показывать то же, что и такты: сетка уже
         // отбросила мусорное начало и убрала выбросы, и расходиться с ней нельзя.
         let finalChords = grid.bars.isEmpty ? grid.chords : segments(from: grid.bars, source: grid.chords)
@@ -131,7 +132,7 @@ enum SongAnalyzer {
             beatsPerBar: beat.beatsPerBar,
             beats: grid.beats,
             downbeatOffset: grid.startBeat,
-            key: key?.name,
+            key: (KeyEstimator.estimate(fromChords: finalChords) ?? key)?.name,
             chords: finalChords,
             bars: grid.bars,
             tempoConfidence: beat.confidence

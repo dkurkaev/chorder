@@ -9,17 +9,16 @@ struct AnalysisView: View {
     @StateObject private var player = AudioPlayerController()
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                summaryCard
-                if audioURL != nil { playerCard }
-                if !result.bars.isEmpty { barsCard }
-                if !result.chords.isEmpty { timelineCard }
-                if !result.chords.isEmpty { segmentsCard }
-            }
-            .padding(16)
-            .padding(.bottom, 60)   // чтобы последняя карточка не пряталась под таб-баром
+        // Экран не прокручивается целиком: шапка и плеер остаются на месте, а такты
+        // занимают весь остаток высоты и листаются внутри себя. Иначе, чтобы дойти до
+        // текущего такта, приходится уводить кнопку паузы за край экрана.
+        VStack(alignment: .leading, spacing: 16) {
+            summaryCard
+            if audioURL != nil { playerCard }
+            if !result.bars.isEmpty { barsCard }
         }
+        .padding(16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(Theme.background.ignoresSafeArea())
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
@@ -32,18 +31,21 @@ struct AnalysisView: View {
     private var summaryCard: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .top, spacing: 0) {
-                statistic(value: result.bpm > 0 ? String(format: "%.0f", result.bpm) : "—", caption: "BPM")
-                Divider().frame(height: 40).overlay(Theme.textSecondary.opacity(0.3))
                 statistic(value: result.key ?? "—", caption: "тональность")
                 Divider().frame(height: 40).overlay(Theme.textSecondary.opacity(0.3))
                 statistic(value: "\(result.beatsPerBar)/4", caption: "размер")
                 Divider().frame(height: 40).overlay(Theme.textSecondary.opacity(0.3))
                 statistic(value: result.duration.asTimecode, caption: "длина")
             }
-            if !result.progressionSummary.isEmpty {
-                Text(result.progressionSummary)
-                    .font(.system(size: 15, weight: .medium, design: .rounded))
-                    .foregroundStyle(Theme.textPrimary)
+            // Не вся последовательность, а набор аккордов записи: по нему сразу видно,
+            // на чём она держится, и он не растёт на пол-экрана вместе с длиной фрагмента.
+            if !usedChords.isEmpty {
+                HStack(spacing: 8) {
+                    ForEach(Array(usedChords.enumerated()), id: \.offset) { _, chord in
+                        ChordChip(label: chord, size: 15)
+                    }
+                    Spacer(minLength: 0)
+                }
             }
             if result.tempoConfidence < 0.4 {
                 Label("Ритм определён неуверенно — попробуй записать фрагмент подлиннее или погромче",
@@ -122,49 +124,40 @@ struct AnalysisView: View {
         .frame(height: 5)
     }
 
+    /// Аккорды записи по убыванию звучащего времени — словарь, а не хронология.
+    private var usedChords: [ChordLabel] {
+        var weight: [ChordLabel: Double] = [:]
+        for segment in result.chords where !segment.label.isNone {
+            weight[segment.label, default: 0] += segment.duration
+        }
+        return weight.sorted { ($0.value, $1.key.name) > ($1.value, $0.key.name) }.map { $0.key }
+    }
+
     private var barsCard: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Такты").font(.headline).foregroundStyle(Theme.textPrimary)
-            BarsGridView(bars: result.bars, currentTime: player.currentTime)
-        }
-        .cardStyle()
-    }
-
-    private var timelineCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Лента аккордов").font(.headline).foregroundStyle(Theme.textPrimary)
-            ChordTimelineView(
-                segments: result.chords,
-                duration: result.duration,
-                currentTime: player.currentTime,
-                onSeek: { player.seek(to: $0) }
-            )
-        }
-        .cardStyle()
-    }
-
-    private var segmentsCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Хронология").font(.headline).foregroundStyle(Theme.textPrimary)
-            ForEach(result.chords) { segment in
-                HStack(spacing: 12) {
-                    Text(segment.start.asTimecode)
-                        .font(.system(size: 13, design: .monospaced))
-                        .foregroundStyle(Theme.textSecondary)
-                    ChordChip(
-                        label: segment.label,
-                        isActive: player.currentTime >= segment.start && player.currentTime < segment.end
-                    )
-                    Spacer()
-                    Text(String(format: "%.1f с", segment.duration))
-                        .font(.caption)
-                        .foregroundStyle(Theme.textSecondary)
+            // Список едет сам за проигрыванием и держится в своей рамке: иначе, чтобы
+            // увидеть текущий такт, приходится листать страницу и терять кнопку паузы.
+            ScrollViewReader { proxy in
+                ScrollView {
+                    BarsGridView(bars: result.bars, currentTime: player.currentTime)
+                        .padding(.vertical, 2)
                 }
-                .contentShape(Rectangle())
-                .onTapGesture { player.seek(to: segment.start) }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .onChange(of: activeBarID) { _, id in
+                    guard let id else { return }
+                    withAnimation(.easeInOut(duration: 0.3)) {
+                        proxy.scrollTo(id, anchor: .center)
+                    }
+                }
             }
         }
         .cardStyle()
+        .frame(maxHeight: .infinity)
+    }
+
+    private var activeBarID: UUID? {
+        result.bars.first { player.currentTime >= $0.start && player.currentTime < $0.end }?.id
     }
 
     private var currentChord: ChordLabel {
